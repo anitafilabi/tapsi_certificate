@@ -18,6 +18,8 @@ Streamlit app: Agent cards + Supervisor report (Overview + Daily) — HTML only
 import re
 import math
 import base64
+import importlib.util
+from io import BytesIO
 from datetime import datetime, timedelta
 import streamlit as st
 import pandas as pd
@@ -28,6 +30,10 @@ try:
     _ALT_OK = True
 except Exception:
     _ALT_OK = False
+
+_WEASYPRINT_AVAILABLE = importlib.util.find_spec("weasyprint") is not None
+if _WEASYPRINT_AVAILABLE:
+    from weasyprint import HTML, CSS
 
 # ---------- Helpers ----------
 def spacer(px: int = 8):
@@ -1984,6 +1990,53 @@ def html_download_button(filename: str, html_str: str, label: str):
     b64 = base64.b64encode(html_str.encode("utf-8")).decode()
     st.markdown(f'<a download="{filename}" href="data:text/html;base64,{b64}">{label}</a>', unsafe_allow_html=True)
 
+
+def _font_stylesheet(font_bytes: bytes | None, font_name: str = "CustomPersian"):
+    if not (_WEASYPRINT_AVAILABLE and font_bytes):
+        return None
+    b64_font = base64.b64encode(font_bytes).decode()
+    css = f"""
+    @font-face {{
+      font-family: '{font_name}';
+      src: url(data:font/ttf;base64,{b64_font}) format('truetype');
+      font-weight: normal;
+      font-style: normal;
+    }}
+    * {{ font-family: '{font_name}', 'Vazirmatn', 'IRANSans', 'Tahoma', sans-serif; }}
+    """
+    return CSS(string=css)
+
+
+def html_to_pdf_bytes(html_str: str, font_bytes: bytes | None = None) -> bytes | None:
+    if not _WEASYPRINT_AVAILABLE:
+        return None
+    stylesheets = []
+    css = _font_stylesheet(font_bytes)
+    if css:
+        stylesheets.append(css)
+    buffer = BytesIO()
+    HTML(string=html_str).write_pdf(buffer, stylesheets=stylesheets)
+    return buffer.getvalue()
+
+
+def pdf_download_button(filename: str, html_str: str, label: str, font_bytes: bytes | None = None):
+    if not _WEASYPRINT_AVAILABLE:
+        st.warning("برای دریافت PDF نیاز است کتابخانه WeasyPrint نصب شود: pip install weasyprint")
+        return
+    try:
+        pdf_bytes = html_to_pdf_bytes(html_str, font_bytes=font_bytes)
+    except Exception as exc:
+        st.error(f"خطا در ساخت PDF: {exc}")
+        return
+    if not pdf_bytes:
+        st.warning("امکان ساخت PDF وجود ندارد. لطفاً وضعیت کتابخانه WeasyPrint یا فایل فونت را بررسی کنید.")
+        return
+    b64 = base64.b64encode(pdf_bytes).decode()
+    st.markdown(
+        f'<a download="{filename}" href="data:application/pdf;base64,{b64}">{label}</a>',
+        unsafe_allow_html=True,
+    )
+
 def image_to_b64(file) -> str | None:
     if not file:
         return None
@@ -2970,7 +3023,13 @@ st.markdown(
 with st.sidebar:
     st.markdown("### تنظیمات برند")
     logo_file = st.file_uploader("لوگو (PNG/JPG/SVG)", type=["png","jpg","jpeg","svg"])
+    font_file = st.file_uploader(
+        "فونت فارسی برای PDF (TTF/OTF)",
+        type=["ttf", "otf"],
+        help="برای سالم ماندن حروف فارسی در PDF، فونت اصلی سازمان را بارگذاری کنید.",
+    )
 logo_b64 = image_to_b64(logo_file)
+font_bytes = font_file.read() if font_file else None
 
 uploaded = st.file_uploader("فایل اکسل را انتخاب کنید", type=["xlsx"])
 
@@ -3328,6 +3387,12 @@ if uploaded:
         # کارت + دانلود HTML با تاریخ درست همان آیدی
         card_html = build_card_html(person, from_j_sel, to_j_sel, logo_src=logo_b64, rank_text=rank_text, team_rank_text=team_rank_text, acq_chart_src=chart_src, acq_recent3_total=recent4, acq_last_week=last_week_acq)
         html_download_button(f"card_{person.get('آیدی','agent')}.html", card_html, "دانلود HTML همین کارت")
+        pdf_download_button(
+            f"card_{person.get('آیدی','agent')}.pdf",
+            card_html,
+            "دانلود PDF همین کارت (با فونت فارسی)",
+            font_bytes=font_bytes,
+        )
         st.components.v1.html(card_html, height=600, scrolling=True)
 
         # === جزئیات TOTAL QC SCORE ===
@@ -3764,3 +3829,9 @@ if uploaded:
         fname = f"supervisor_{sel_sup}_{city_disp}.html".replace(" ", "_")
         b64 = base64.b64encode(html.encode("utf-8")).decode()
         st.markdown(f'<a download="{fname}" href="data:text/html;base64,{b64}">دانلود HTML گزارش سرپرست</a>', unsafe_allow_html=True)
+        pdf_download_button(
+            f"supervisor_{sel_sup}_{city_disp}.pdf".replace(" ", "_"),
+            html,
+            "دانلود PDF گزارش سرپرست (با فونت فارسی)",
+            font_bytes=font_bytes,
+        )
