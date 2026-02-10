@@ -15,12 +15,15 @@ Streamlit app: Agent cards + Supervisor report (Overview + Daily) — HTML only
 - NEW: نمودار Altair ترند ۴ هفته‌ای متریک‌ها زیر کارت تکی
 """
 
+import os
 import re
+import html as html_module
 import math
 import base64
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 import streamlit as st
 import pandas as pd
+import numpy as np
 
 # --- Optional: Altair chart ---
 try:
@@ -28,6 +31,8 @@ try:
     _ALT_OK = True
 except Exception:
     _ALT_OK = False
+
+# ماژول‌های PDF حذف شده‌اند؛ خروجی فقط HTML/ODF است.
 
 # ---------- Helpers ----------
 def spacer(px: int = 8):
@@ -86,6 +91,38 @@ def fmt_val(x, percent=False, nd=2):
     return f"{v:.{nd}f}"
 
 _PERSIAN_DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹", "0123456789")
+
+def parse_shamsi_date(value):
+    if value is None or (hasattr(pd, "isna") and pd.isna(value)):
+        return None
+    if isinstance(value, datetime):
+        jy, jm, jd = value.year, value.month, value.day
+    elif isinstance(value, date):
+        jy, jm, jd = value.year, value.month, value.day
+    else:
+        s = str(value).strip()
+        if not s:
+            return None
+        s = s.translate(_PERSIAN_DIGITS).replace("/", "-")
+        parts = s.split("-")
+        if len(parts) < 3:
+            return None
+        try:
+            jy, jm, jd = int(parts[0]), int(parts[1]), int(parts[2])
+        except ValueError:
+            return None
+    try:
+        gy, gm, gd = jalali_to_gregorian(jy, jm, jd)
+        return date(gy, gm, gd)
+    except Exception:
+        return None
+
+def parse_date_series(series, is_shamsi=False):
+    if series is None:
+        return pd.Series(dtype="datetime64[ns]")
+    if is_shamsi:
+        return series.apply(parse_shamsi_date)
+    return pd.to_datetime(series, errors="coerce").dt.date
 
 def to_numeric_clean(series):
     """Convert a pandas Series to numeric after stripping commas and فارسی digits."""
@@ -155,6 +192,48 @@ def gregorian_to_jalali(g_y: int, g_m: int, g_d: int):
     jd = j_day_no + 1
     return jy, jm + 1, jd
 
+def jalali_to_gregorian(j_y: int, j_m: int, j_d: int):
+    j_days_in_month = [31, 31, 31, 31, 31, 31, 30, 30, 30, 30, 30, 29]
+    jy = j_y - 979
+    jm = j_m - 1
+    jd = j_d - 1
+
+    j_day_no = 365 * jy + (jy // 33) * 8 + (jy % 33 + 3) // 4
+    for i in range(jm):
+        j_day_no += j_days_in_month[i]
+    j_day_no += jd
+
+    g_day_no = j_day_no + 79
+    gy = 1600 + 400 * (g_day_no // 146097)
+    g_day_no %= 146097
+
+    leap = True
+    if g_day_no >= 36525:
+        g_day_no -= 1
+        gy += 100 * (g_day_no // 36524)
+        g_day_no %= 36524
+        if g_day_no >= 365:
+            g_day_no += 1
+        else:
+            leap = False
+
+    gy += 4 * (g_day_no // 1461)
+    g_day_no %= 1461
+
+    if g_day_no >= 366:
+        leap = False
+        g_day_no -= 1
+        gy += g_day_no // 365
+        g_day_no %= 365
+
+    g_days_in_month = [31, 28 + (1 if leap else 0), 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    gm = 0
+    while gm < 11 and g_day_no >= g_days_in_month[gm]:
+        g_day_no -= g_days_in_month[gm]
+        gm += 1
+    gd = g_day_no + 1
+    return gy, gm + 1, gd
+
 PERSIAN_MONTHS = [
     "فروردین","اردیبهشت","خرداد","تیر","مرداد","شهریور",
     "مهر","آبان","آذر","دی","بهمن","اسفند"
@@ -183,6 +262,21 @@ def to_jalali_day_month(dt, persian_digits=True) -> str:
         out = out.translate(str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹"))
     return out
 
+
+def shamsi_week_bounds(g_date: date, include_friday: bool = False) -> tuple[date, date]:
+    """
+    ورودی: تاریخ میلادی (datetime.date)
+    خروجی: شروع و پایان هفته‌ی شمسی که شنبه شروع می‌شود.
+
+    - شروع هفته: شنبه‌ی همان هفته (با محاسبه بر اساس weekday میلادی)
+    - پایان هفته: پیش‌فرض پنج‌شنبه (۶ روزهٔ کاری). اگر include_friday=True باشد، جمعه هم اضافه می‌شود.
+    """
+    # weekday: Monday=0 ... Sunday=6. Saturday => 5
+    delta_to_saturday = (g_date.weekday() - 5) % 7
+    start = g_date - timedelta(days=delta_to_saturday)
+    end = start + timedelta(days=6 if include_friday else 5)
+    return start, end
+
 def export_qc_last_record_for_month(df, mp, jalali_month, year=1404, filename="output.xlsx"):
     """
     ساخت خروجی اکسل برای آخرین TOTAL QC SCORE هر بازاریاب در یک ماه شمسی مشخص
@@ -190,21 +284,19 @@ def export_qc_last_record_for_month(df, mp, jalali_month, year=1404, filename="o
     year = سال شمسی (پیش‌فرض 1404)
     """
 
-    date_col = mp["date"]
+    # ستون آیدی و تاریخ را از mapping دریافت می‌کنیم
     id_col   = mp["id"]
+    date_col_name = mp["date"] # نام ستون تاریخ شناسایی شده توسط find_column_mapping
 
     tmp = df.copy()
-    tmp["_date"] = pd.to_datetime(tmp[date_col], errors="coerce")
 
-    # تبدیل میلادی → شمسی
+    # اطمینان از اینکه ستون تاریخ میلادی (_date) وجود دارد
+    # این ستون از parse_date_series که شامل تبدیل شمسی به میلادی است، پر می‌شود
+    tmp["_date"] = parse_date_series(tmp[date_col_name], mp.get("date_is_shamsi", False))
+
+    # تبدیل میلادی → شمسی برای استخراج سال و ماه شمسی
     def _jalali_parts(dt):
-        """
-        تبدیل یک تاریخ میلادی (datetime) به مؤلفه‌های شمسی (سال، ماه، روز).
-        اگر مقدار ورودی NaT یا None باشد، یک سه‌تایی از None برمی‌گرداند تا در فراخوانی‌های بعدی
-        (مانند _jalali_parts(x)[0]) خطایی به وجود نیاید.
-        """
         if pd.isna(dt):
-            # مقدار datetime نامعتبر یا خالی است؛ بازگشت یک سه‌تایی None
             return (None, None, None)
         y, m, d = gregorian_to_jalali(dt.year, dt.month, dt.day)
         return (y, m, d)
@@ -212,29 +304,153 @@ def export_qc_last_record_for_month(df, mp, jalali_month, year=1404, filename="o
     tmp["_jy"] = tmp["_date"].apply(lambda x: _jalali_parts(x)[0] if x is not None else None)
     tmp["_jm"] = tmp["_date"].apply(lambda x: _jalali_parts(x)[1] if x is not None else None)
 
-    # فیلتر روی ماه مورد نظر
+    # فیلتر روی سال و ماه شمسی مورد نظر (jalali_month و year پارامترهای ورودی هستند)
     tmp = tmp[(tmp["_jy"] == year) & (tmp["_jm"] == jalali_month)]
     if tmp.empty:
-        print(f"هیچ داده‌ای برای ماه {jalali_month} پیدا نشد.")
+        print(f"هیچ داده‌ای برای ماه {jalali_month} سال {year} پیدا نشد.")
         return None
 
-    # اگر ستون total qc score وجود ندارد → محاسبه کن
+    # اگر ستون TOTAL QC SCORE وجود ندارد، آن را محاسبه می‌کنیم
     if "TOTAL QC SCORE" not in tmp.columns:
+        # فرض می‌کنیم compute_total_qc_score_from_row روی هر ردیف کار می‌کند
         tmp["TOTAL QC SCORE"] = tmp.apply(compute_total_qc_score_from_row, axis=1)
 
-    # آخرین رکورد هر آیدی
-    tmp = tmp.sort_values("_date")
-    last_rows = tmp.groupby(id_col).tail(1)
+    # گروه‌بندی بر اساس آیدی و محاسبه میانگین TOTAL QC SCORE برای هر نفر در این ماه
+    # همچنین اطلاعات نام و شهر را نیز حفظ می‌کنیم (first/last)
+    grouped_qc_scores = tmp.groupby(id_col).agg(
+        Name=(mp.get("name",""), "first"), # گرفتن اولین نام
+        City=(mp.get("city",""), "first"), # گرفتن اولین شهر
+        Average_TOTAL_QC_SCORE=("TOTAL QC SCORE", "mean") # محاسبه میانگین نمره
+    ).reset_index()
 
-    # انتخاب ستون‌های لازم
-    out = last_rows[[id_col, mp.get("name",""), mp.get("city",""), "TOTAL QC SCORE"]].copy()
-    out = out.rename(columns={mp.get("name",""): "Name", mp.get("city",""): "City"})
+    # انتخاب ستون‌های لازم برای خروجی نهایی
+    out = grouped_qc_scores[[id_col, "Name", "City", "Average_TOTAL_QC_SCORE"]].copy()
+
+    # تغییر نام ستون آیدی
+    out = out.rename(columns={id_col: "ID"})
+
+    # فرمت‌دهی اعشار Average_TOTAL_QC_SCORE تا 3 رقم اعشار
+    out["Average_TOTAL_QC_SCORE"] = out["Average_TOTAL_QC_SCORE"].apply(lambda x: f"{x:.3f}")
+
+    print(f"میانگین Total QC Score برای هر آیدی در ماه {jalali_month} سال {year} استخراج شد.")
 
     # ذخیره در اکسل
     out.to_excel(filename, index=False)
     print(f"فایل '{filename}' ساخته شد.")
 
     return out
+
+def get_avg_qc_score_for_months(df: pd.DataFrame, mp: dict, jalali_months: list = [7, 8, 9], year: int = 1403) -> pd.DataFrame:
+    """
+    محاسبه میانگین TOTAL QC SCORE برای هر نفر در ماه‌های مشخص شده
+    
+    Parameters:
+    -----------
+    df : pd.DataFrame
+        داده‌های خام
+    mp : dict
+        mapping ستون‌ها (از find_column_mapping)
+    jalali_months : list
+        لیست ماه‌های شمسی (پیش‌فرض: [7, 8, 9] یعنی مهر، آبان، آذر)
+    year : int
+        سال شمسی (پیش‌فرض: 1403)
+    
+    Returns:
+    --------
+    pd.DataFrame با ستون‌های:
+        - آیدی
+        - نام
+        - شهر
+        - میانگین_مهر (یا ماه اول)
+        - میانگین_آبان (یا ماه دوم)
+        - میانگین_آذر (یا ماه سوم)
+        - میانگین_کل_سه_ماه
+    """
+    id_col = mp.get("id")
+    if not id_col:
+        raise ValueError("ستون 'id' (آیدی) در mapping پیدا نشد.")
+    
+    date_col = mp.get("date")
+    if not date_col:
+        raise ValueError("ستون 'date' (تاریخ) در mapping پیدا نشد.")
+    
+    # کپی از داده‌ها
+    tmp = df.copy()
+    
+    # اضافه کردن ستون تاریخ میلادی
+    tmp["_date"] = parse_date_series(tmp[date_col], mp.get("date_is_shamsi", False))
+    
+    # تبدیل به تاریخ شمسی
+    def _jalali_parts(dt):
+        if pd.isna(dt):
+            return (None, None, None)
+        y, m, d = gregorian_to_jalali(dt.year, dt.month, dt.day)
+        return (y, m, d)
+    
+    tmp["_jy"] = tmp["_date"].apply(lambda x: _jalali_parts(x)[0] if x is not None else None)
+    tmp["_jm"] = tmp["_date"].apply(lambda x: _jalali_parts(x)[1] if x is not None else None)
+    
+    # فیلتر کردن داده‌ها برای ماه‌های مورد نظر
+    tmp = tmp[(tmp["_jy"] == year) & (tmp["_jm"].isin(jalali_months))]
+    
+    if tmp.empty:
+        return pd.DataFrame(columns=[id_col, "نام", "شهر"] + [f"میانگین_{PERSIAN_MONTHS[m-1]}" for m in jalali_months] + ["میانگین_کل_سه_ماه"])
+    
+    # محاسبه آمار هفتگی برای هر ماه
+    # ابتدا برای هر ماه جداگانه محاسبه می‌کنیم
+    results = []
+    
+    for month_num in jalali_months:
+        month_name = PERSIAN_MONTHS[month_num - 1]
+        month_data = tmp[tmp["_jm"] == month_num].copy()
+        
+        if month_data.empty:
+            continue
+        
+        # محاسبه آمار هفتگی برای این ماه
+        monthly_stats = compute_weekly_stats(month_data, mp)
+        
+        if monthly_stats.empty or "TOTAL QC SCORE" not in monthly_stats.columns:
+            continue
+        
+        # compute_weekly_stats ستون id را به "آیدی" تغییر نام می‌دهد
+        # پس باید از "آیدی" استفاده کنیم
+        id_col_in_stats = "آیدی" if "آیدی" in monthly_stats.columns else id_col
+        
+        # محاسبه میانگین TOTAL QC SCORE برای هر نفر در این ماه
+        monthly_avg = monthly_stats.groupby(id_col_in_stats).agg(
+            Name=("نام و نام خانوادگی", "first") if "نام و نام خانوادگی" in monthly_stats.columns else (mp.get("name", ""), "first"),
+            City=("شهر", "first") if "شهر" in monthly_stats.columns else (mp.get("city", ""), "first"),
+            QC_Score=("TOTAL QC SCORE", "mean")
+        ).reset_index()
+        
+        # تغییر نام ستون id به id_col برای merge کردن بعدی
+        if id_col_in_stats != id_col:
+            monthly_avg = monthly_avg.rename(columns={id_col_in_stats: id_col})
+        
+        monthly_avg = monthly_avg.rename(columns={"QC_Score": f"میانگین_{month_name}"})
+        results.append(monthly_avg)
+    
+    if not results:
+        return pd.DataFrame(columns=[id_col, "نام", "شهر"] + [f"میانگین_{PERSIAN_MONTHS[m-1]}" for m in jalali_months] + ["میانگین_کل_سه_ماه"])
+    
+    # merge کردن نتایج همه ماه‌ها
+    final_df = results[0]
+    for i in range(1, len(results)):
+        final_df = final_df.merge(
+            results[i][[id_col, f"میانگین_{PERSIAN_MONTHS[jalali_months[i]-1]}"]],
+            on=id_col,
+            how="outer"
+        )
+    
+    # محاسبه میانگین کل سه ماه
+    qc_cols = [f"میانگین_{PERSIAN_MONTHS[m-1]}" for m in jalali_months]
+    final_df["میانگین_کل_سه_ماه"] = final_df[qc_cols].mean(axis=1)
+    
+    # مرتب‌سازی بر اساس میانگین کل (نزولی)
+    final_df = final_df.sort_values("میانگین_کل_سه_ماه", ascending=False).reset_index(drop=True)
+    
+    return final_df
 
 def find_column_mapping(df: pd.DataFrame) -> dict:
     m, norm = {}, {c: normalize_header(c) for c in df.columns}
@@ -247,6 +463,15 @@ def find_column_mapping(df: pd.DataFrame) -> dict:
 
     # raw columns
     m["date"]             = find("miladi", "date")   # ← دیگه فقط miladi نیست
+    m["date_is_shamsi"]   = False
+    if m["date"]:
+        n = norm.get(m["date"], "")
+        if any(k in n for k in ["shamsi", "jalali", "????"]):
+            m["date_is_shamsi"] = True
+    else:
+        m["date"] = find("????", "jalali", "shamsi", "jdate", "persian date")
+        if m["date"]:
+            m["date_is_shamsi"] = True
     m["id"]               = find("آیدی","ایدی","id")
     m["name"]             = find("نام و نام خانوادگی","نام","name","fullname","full name")
     m["city"]             = find("city","شهر")
@@ -311,7 +536,7 @@ def find_column_mapping(df: pd.DataFrame) -> dict:
     if not m.get("id"):
         raise ValueError("ستون «آیدی» پیدا نشد.")
     if not m.get("date"):
-        raise ValueError("ستون تاریخ (date / miladi) پیدا نشد.")
+        raise ValueError("ستون تاریخ (date / miladi / shamsi) پیدا نشد.")
     if not m.get("actual_ts_excel"):
         raise ValueError("ستون «actualTeamSize» پیدا نشد.")
     if not m.get("team_size_excel"):
@@ -323,23 +548,38 @@ def find_column_mapping(df: pd.DataFrame) -> dict:
     return m
 
 
-def filter_last_7_days(df: pd.DataFrame, date_col: str, anchor_date: datetime = None) -> pd.DataFrame:
+def filter_last_7_days(df: pd.DataFrame, date_col: str, anchor_date: datetime = None, date_is_shamsi: bool = False) -> pd.DataFrame:
     tmp = df.copy()
-    tmp["_date"] = pd.to_datetime(tmp[date_col], errors="coerce").dt.date
+    tmp["_date"] = parse_date_series(tmp[date_col], date_is_shamsi)
     if anchor_date is None: anchor_date = pd.to_datetime(tmp["_date"]).max()
     if pd.isna(anchor_date): return tmp.iloc[0:0]
     anchor = pd.to_datetime(anchor_date).date()
     start = anchor - timedelta(days=6)
     return tmp[(tmp["_date"] >= start) & (tmp["_date"] <= anchor)]
 
-def filter_last_7_days_per_group(df: pd.DataFrame, date_col: str, group_col: str) -> pd.DataFrame:
+def filter_last_7_days_per_group(df: pd.DataFrame, date_col: str, group_col: str, date_is_shamsi: bool = False) -> pd.DataFrame:
     tmp = df.copy()
-    tmp["_date"] = pd.to_datetime(tmp[date_col], errors="coerce").dt.date
+    tmp["_date"] = parse_date_series(tmp[date_col], date_is_shamsi)
     # آخرین تاریخ در هر شهر
     grp_max = tmp.groupby(group_col)["_date"].transform("max")
     # بازهٔ ۷ روزه نسبت به آخرین تاریخ همان شهر
     mask = (tmp["_date"] >= (grp_max - pd.to_timedelta(6, unit="D"))) & (tmp["_date"] <= grp_max)
     return tmp[mask]
+
+def filter_last_3_months(df: pd.DataFrame, date_col: str, anchor_date: datetime = None, date_is_shamsi: bool = False) -> pd.DataFrame:
+    """
+    فیلتر کردن داده‌های سه ماه اخیر نسبت به anchor_date
+    اگر anchor_date داده نشده، از آخرین تاریخ موجود استفاده می‌کند
+    """
+    tmp = df.copy()
+    tmp["_date"] = parse_date_series(tmp[date_col], date_is_shamsi)
+    if anchor_date is None:
+        anchor_date = pd.to_datetime(tmp["_date"]).max()
+    if pd.isna(anchor_date):
+        return tmp.iloc[0:0]
+    anchor = pd.to_datetime(anchor_date).date()
+    start = anchor - pd.DateOffset(months=3)
+    return tmp[(tmp["_date"] >= start.date()) & (tmp["_date"] <= anchor)]
 
 # ---------- Agent weekly (cards) ----------
 def _combine_edu_presence_label(row) -> str:
@@ -378,17 +618,253 @@ def _combine_edu_presence_label(row) -> str:
     else:
         return "عالی"
 
+def compute_weekly_stats_by_week(df: pd.DataFrame, mp: dict) -> pd.DataFrame:
+    """
+    محاسبه آمار هفتگی برای هر بازاریاب به تفکیک هفته
+    خروجی: DataFrame با ستون‌های آیدی، هفته، و تمام متریک‌ها شامل TOTAL QC SCORE
+    """
+    id_col = mp["id"]
+    df = df.copy()
+    
+    # اگر ستون week وجود ندارد، خروجی خالی برگردان
+    if not mp.get("week") or mp["week"] not in df.columns:
+        return pd.DataFrame()
+    
+    # تبدیل هفته به عددی
+    df["_week_num"] = to_numeric_clean(df[mp["week"]])
+    df = df.dropna(subset=["_week_num"])
+    
+    if df.empty:
+        return pd.DataFrame()
+    
+    # جمع جذب برای هر آیدی و هفته
+    if mp.get("acq") and mp["acq"] in df.columns:
+        acq_weekly = (
+            df.groupby([id_col, "_week_num"], dropna=False)[mp["acq"]]
+            .apply(lambda x: to_numeric_clean(x).sum())
+            .reset_index()
+        )
+        acq_weekly = acq_weekly.rename(columns={mp["acq"]: "_acq_weekly_sum"})
+        df = df.merge(acq_weekly, on=[id_col, "_week_num"], how="left")
+        mask = df["_acq_weekly_sum"].notna()
+        df.loc[mask, mp["acq"]] = df.loc[mask, "_acq_weekly_sum"]
+        df = df.drop(columns=["_acq_weekly_sum"], errors="ignore")
+    
+    # Unique کردن بر اساس آیدی و هفته
+    df = df.drop_duplicates(subset=[id_col, "_week_num"], keep='first')
+    
+    # ساخت نمره QC ناظران میدانی (فقط بر اساس نمره‌های QC راننده‌ها؛
+    # متریک‌های biker مثل presenceQuality/banner دیگر اثر ندارند)
+    def _parse_pct(v):
+        if v is None or (hasattr(pd,"isna") and pd.isna(v)):
+            return None
+        s = str(v).strip().replace(",", "")
+        if s.endswith("%") or s.endswith("٪"):
+            s = s[:-1].strip()
+        if s == "":
+            return None
+        try:
+            x = float(s)
+            if x <= 1.01:
+                x *= 100.0
+            return x
+        except Exception:
+            return None
+    
+    if mp.get("presence_score") or mp.get("edu_score"):
+        def _combine_field_q(row):
+            vals = []
+            for extra_col in [mp.get("presence_score"), mp.get("edu_score")]:
+                if extra_col and extra_col in row.index:
+                    v = _parse_pct(row[extra_col])
+                    if v is not None:
+                        vals.append(v)
+            if not vals:
+                return None
+            return sum(vals)/len(vals)
+        df["_field_q"] = df.apply(_combine_field_q, axis=1)
+    
+    # روزهای کاری برای هر آیدی و هفته
+    if "_date" in df.columns:
+        unique_days = (df[[id_col, "_week_num", "_date"]].dropna()
+                      .drop_duplicates([id_col, "_week_num", "_date"])
+                      .groupby([id_col, "_week_num"])["_date"].nunique()
+                      .rename("روزهای کاری"))
+    else:
+        unique_days = pd.Series(dtype="int64")
+    
+    # تجمیع بر اساس آیدی و هفته
+    agg = {}
+    if mp.get("week"): 
+        agg[mp["week"]] = "first"
+    for k in ["name","city","supervisor","teamlead"]:
+        col = mp.get(k)
+        if col: agg[col] = "first"
+    
+    for extra_col in [mp.get("presence_score"), mp.get("edu_score")]:
+        if extra_col:
+            agg[extra_col] = "mean"
+    
+    # جمع‌ها
+    if mp.get("team_size_excel"):
+        agg[mp["team_size_excel"]] = "sum"
+    if mp.get("absence"):      agg[mp["absence"]]      = "sum"
+    if mp.get("incomplete"):   agg[mp["incomplete"]]   = "sum"
+    if mp.get("fake_sub"):     agg[mp["fake_sub"]]     = "sum"
+    if mp.get("shift_delay"):  agg[mp["shift_delay"]]  = "sum"
+    if mp.get("false_check"):  agg[mp["false_check"]]  = "sum"
+    if mp.get("goldentime"):   agg[mp["goldentime"]]   = "sum"
+    if mp.get("total_hours"):  agg[mp["total_hours"]]  = "sum"
+    if mp.get("acq"):          agg[mp["acq"]]          = "sum"
+    if mp.get("active_drivers"):   agg[mp["active_drivers"]]   = "sum"
+    if mp.get("tatbigh"):      agg[mp["tatbigh"]]      = "mean"
+    
+    for col in DOC_ISSUE_COLS:
+        if col in df.columns:
+            agg[col] = "sum"
+    if "تعداد راننده فعال" in df.columns:
+        agg["تعداد راننده فعال"] = "sum"
+    
+    for k in ["edu_score","presence_score","presence_qual"]:
+        col = mp.get(k)
+        if col: agg[col] = "mean"
+    
+    detail_cols = [
+        "مراجعه", "وضعیت حضور", "پوشش و رفتار مناسب", "مدت زمان ثبت نام",
+        "مزایا", "تسویه روزانه", "پشتیبانی", "وعده ی غیرواقعی", "وعده غیرواقعی",
+    ]
+    for col in df.columns:
+        if str(col).strip() in detail_cols:
+            agg[col] = "mean"
+    
+    if "_field_q" in df.columns:
+        agg["_field_q"] = "mean"
+    
+    # گروه‌بندی بر اساس آیدی و هفته
+    base = df.groupby([id_col, "_week_num"]).agg(agg).reset_index()
+    if not unique_days.empty:
+        base = base.merge(unique_days, on=[id_col, "_week_num"], how="left")
+    else:
+        base["روزهای کاری"] = 0
+    
+    # تغییر نام ستون‌ها
+    rename_map = {id_col: "آیدی", "_week_num": "هفته"}
+    if mp.get("name"):           rename_map[mp["name"]] = "نام و نام خانوادگی"
+    if mp.get("city"):           rename_map[mp["city"]] = "شهر"
+    if mp.get("supervisor"):     rename_map[mp["supervisor"]] = "سرپرست"
+    if mp.get("teamlead"):       rename_map[mp["teamlead"]] = "تیم‌ لید"
+    if mp.get("team_size_excel"): rename_map[mp["team_size_excel"]] = "تعداد فیلد های تخصیص داده شده"
+    if mp.get("absence"):         rename_map[mp["absence"]]         = "روزهای بدون مشارکت"
+    if mp.get("incomplete"):      rename_map[mp["incomplete"]]      = "مشارکت‌های ناقص"
+    if mp.get("fake_sub"):        rename_map[mp["fake_sub"]]        = "مشارکت خارج از محدوده مجاز"
+    if mp.get("shift_delay"):     rename_map[mp["shift_delay"]]     = "مشارکت با تاخیر"
+    if mp.get("false_check"):     rename_map[mp["false_check"]]     = "خوداظهاری اشتباه"
+    if mp.get("goldentime"):      rename_map[mp["goldentime"]]      = "ساعات طلایی"
+    if mp.get("total_hours"):     rename_map[mp["total_hours"]]     = "ساعات کاری کل"
+    if mp.get("acq"):             rename_map[mp["acq"]]             = "تعداد جذب"
+    if mp.get("activation"):      rename_map[mp["activation"]]      = "فعال سازی"
+    if mp.get("tatbigh"):         rename_map[mp["tatbigh"]]         = "تطبیق"
+    if mp.get("active_drivers"):  rename_map[mp["active_drivers"]]  = "تعداد راننده‌های فعال"
+    if mp.get("edu_score"):       rename_map[mp["edu_score"]]       = "نمره آموزش توسط راننده ها"
+    if mp.get("presence_score"):  rename_map[mp["presence_score"]]  = "نمره حضور توسط راننده ها"
+    if "_field_q" in base.columns:
+        rename_map["_field_q"] = "نمره QC ناظران میدانی"
+    for dc in detail_cols:
+        if dc in base.columns:
+            rename_map[dc] = dc
+    
+    out = base.rename(columns=rename_map)
+    
+    # محاسبه درصد راننده‌های فعال
+    if "تعداد راننده‌های فعال" in out.columns and "تعداد جذب" in out.columns:
+        active_num = to_numeric_clean(out["تعداد راننده‌های فعال"])
+        acq_num = to_numeric_clean(out["تعداد جذب"])
+        out["درصد راننده‌های فعال"] = (active_num / acq_num.replace(0, pd.NA)) * 100
+    
+    # محاسبه نقص مدارک
+    doc_cols_present = [c for c in DOC_ISSUE_COLS if c in out.columns]
+    if doc_cols_present:
+        doc_numeric = out[doc_cols_present].apply(lambda col: to_numeric_clean(col))
+        out["تعداد نقص مدارک"] = doc_numeric.sum(axis=1, min_count=1)
+        if "تعداد نقص مدارک" in out.columns and "تعداد جذب" in out.columns:
+            doc_count = to_numeric_clean(out["تعداد نقص مدارک"])
+            acq_count = to_numeric_clean(out["تعداد جذب"])
+            acq_safe = acq_count.replace(0, pd.NA)
+            pct_series = (doc_count / acq_safe) * 100.0
+            out["درصد نقص مدارک"] = pct_series
+    
+    # نمره QC راننده‌ها
+    out["نمره QC راننده ها"] = out.apply(_combine_edu_presence_label, axis=1)
+    
+    # تبدیل به عددی
+    numeric_cols = [
+        "تعداد فیلد های تخصیص داده شده","روزهای بدون مشارکت","مشارکت‌های ناقص",
+        "مشارکت خارج از محدوده مجاز","مشارکت با تاخیر","خوداظهاری اشتباه",
+        "روزهای کاری","تعداد جذب","نمره QC ناظران میدانی","فعال سازی","تطبیق",
+        "ساعات طلایی","ساعات کاری کل","تعداد راننده‌های فعال","تعداد نقص مدارک",
+    ]
+    numeric_cols += [c for c in DOC_ISSUE_COLS if c in out.columns]
+    for c in numeric_cols:
+        if c in out.columns:
+            out[c] = to_numeric_clean(out[c])
+    
+    # محاسبه TOTAL QC SCORE (قدیم و جدید در دو ستون برای مقایسه)
+    if all(col in out.columns for col in [
+        "خوداظهاری اشتباه", "ساعات طلایی", "ساعات کاری کل", "روزهای کاری",
+        "مشارکت با تاخیر", "مشارکت‌های ناقص", "تعداد فیلد های تخصیص داده شده",
+    ]):
+        # نسخه قدیمی (با متریک‌های biker و بدون پخش مجدد وزن‌ها)
+        out["TOTAL QC SCORE (قدیم)"] = out.apply(compute_total_qc_score_from_row_old, axis=1)
+        # نسخه جدید (بدون متریک‌های biker و با پخش وزن روی بقیه)
+        out["TOTAL QC SCORE"] = out.apply(compute_total_qc_score_from_row, axis=1)
+        # اختلاف برای تحلیل
+        out["TOTAL QC DIFF (جدید-قدیم)"] = out["TOTAL QC SCORE"] - out["TOTAL QC SCORE (قدیم)"]
+    
+    # مرتب‌سازی بر اساس آیدی و هفته
+    out = out.sort_values(["آیدی", "هفته"]).reset_index(drop=True)
+    
+    return out
+
 def compute_weekly_stats(df: pd.DataFrame, mp: dict) -> pd.DataFrame:
     id_col = mp["id"]
 
     # یک کپی از df برای اینکه ستون موقتی اضافه کنیم
     df = df.copy()
+    
+    # ✅ ابتدا جذب را برای هر هفته جمع می‌کنیم (اگر ستون week وجود دارد)
+    # این کار باعث می‌شود که اگر در یک هفته چند ردیف برای یک آیدی باشد، جذب کامل جمع شود
+    if mp.get("week") and mp["week"] in df.columns and mp.get("acq") and mp["acq"] in df.columns:
+        # تبدیل هفته به عددی برای محاسبه دقیق‌تر
+        df["_week_num"] = to_numeric_clean(df[mp["week"]])
+        
+        # جمع جذب برای هر آیدی و هفته (بدون در نظر گرفتن NaN)
+        acq_weekly = (
+            df.groupby([id_col, "_week_num"], dropna=False)[mp["acq"]]
+            .apply(lambda x: to_numeric_clean(x).sum())
+            .reset_index()
+        )
+        acq_weekly = acq_weekly.rename(columns={mp["acq"]: "_acq_weekly_sum"})
+        
+        # اضافه کردن ستون جمع جذب هفته‌ای به df
+        df = df.merge(acq_weekly, on=[id_col, "_week_num"], how="left")
+        
+        # جایگزین کردن مقادیر جذب با مجموع هفته‌ای (فقط برای ردیف‌هایی که merge شده‌اند)
+        mask = df["_acq_weekly_sum"].notna()
+        df.loc[mask, mp["acq"]] = df.loc[mask, "_acq_weekly_sum"]
+        df = df.drop(columns=["_acq_weekly_sum", "_week_num"], errors="ignore")
+    
+    # ✅ Unique کردن بر اساس آیدی و هفته (یا تاریخ) - اگر در هر هفته چند ردیف برای یک آیدی باشد، فقط یکی را می‌شماریم
+    if mp.get("week") and mp["week"] in df.columns:
+        # اگر ستون week وجود دارد، بر اساس آیدی و هفته unique می‌کنیم
+        df = df.drop_duplicates(subset=[id_col, mp["week"]], keep='first')
+    elif "_date" in df.columns:
+        # اگر ستون _date وجود دارد، بر اساس آیدی و تاریخ unique می‌کنیم
+        df = df.drop_duplicates(subset=[id_col, "_date"], keep='first')
+    elif mp.get("date") and mp["date"] in df.columns:
+        # اگر ستون date وجود دارد، بر اساس آیدی و تاریخ unique می‌کنیم
+        df = df.drop_duplicates(subset=[id_col, mp["date"]], keep='first')
 
-    # ------ ساخت نمره QC ناظران میدانی از روی دو ستون روزانه ------
-    pq_col = mp.get("presence_q_daily")
-    bq_col = mp.get("banner_q_daily")
-
-
+    # ------ ساخت نمره QC ناظران میدانی (بدون استفاده مستقیم از متریک‌های biker) ------
     def _parse_pct(v):
         if v is None or (hasattr(pd,"isna") and pd.isna(v)):
             return None
@@ -406,17 +882,15 @@ def compute_weekly_stats(df: pd.DataFrame, mp: dict) -> pd.DataFrame:
         except Exception:
             return None
 
-    if pq_col or bq_col:
+    if mp.get("presence_score") or mp.get("edu_score"):
         def _combine_field_q(row):
             vals = []
-            if pq_col and pq_col in row.index:
-                v = _parse_pct(row[pq_col])
-                if v is not None:
-                    vals.append(v)
-            if bq_col and bq_col in row.index:
-                v = _parse_pct(row[bq_col])
-                if v is not None:
-                    vals.append(v)
+            # Presence/Education Score → برای QC ناظران میدانی (با نادیده گرفتن مقادیر خالی)
+            for extra_col in [mp.get("presence_score"), mp.get("edu_score")]:
+                if extra_col and extra_col in row.index:
+                    v = _parse_pct(row[extra_col])
+                    if v is not None:
+                        vals.append(v)
             if not vals:
                 return None
             return sum(vals)/len(vals)
@@ -431,15 +905,16 @@ def compute_weekly_stats(df: pd.DataFrame, mp: dict) -> pd.DataFrame:
                    .rename("روزهای کاری"))
 
     agg = {}
+    # اضافه کردن ستون week به agg تا در خروجی حفظ شود
+    if mp.get("week"): agg[mp["week"]] = "first"
     for k in ["name","city","supervisor","teamlead"]:
         col = mp.get(k)
         if col: agg[col] = "first"
 
-    if pq_col:
-        agg[pq_col] = "mean"
-
-    if bq_col:
-        agg[bq_col] = "mean"
+    # Presence/Education Score → میانگین برای QC ناظران میدانی (در صورت وجود)
+    for extra_col in [mp.get("presence_score"), mp.get("edu_score")]:
+        if extra_col:
+            agg[extra_col] = "mean"
 
     # جمع‌ها (Agent)
     if mp.get("team_size_excel"):
@@ -545,9 +1020,16 @@ def compute_weekly_stats(df: pd.DataFrame, mp: dict) -> pd.DataFrame:
     if doc_cols_present:
         doc_numeric = out[doc_cols_present].apply(lambda col: to_numeric_clean(col))
         out["تعداد نقص مدارک"] = doc_numeric.sum(axis=1, min_count=1)
-
-    if "تطبیق" in out.columns and "درصد نقص مدارک" not in out.columns:
-        out["درصد نقص مدارک"] = out["تطبیق"]
+        
+        # ✅ محاسبه درصد نقص مدارک: تعداد نقص مدارک / جذب همان بازه * 100
+        if "تعداد نقص مدارک" in out.columns and "تعداد جذب" in out.columns:
+            doc_count = to_numeric_clean(out["تعداد نقص مدارک"])
+            acq_count = to_numeric_clean(out["تعداد جذب"])
+            # تقسیم با جایگزینی صفر با NA برای جلوگیری از تقسیم بر صفر
+            acq_safe = acq_count.replace(0, pd.NA)
+            # محاسبه درصد: (تعداد نقص / جذب) * 100
+            pct_series = (doc_count / acq_safe) * 100.0
+            out["درصد نقص مدارک"] = pct_series
     if "فعال سازی" in out.columns and "درصد راننده‌های فعال" not in out.columns:
         out["درصد راننده‌های فعال"] = out["فعال سازی"]
 
@@ -783,14 +1265,15 @@ def build_acq_trend_last4weeks(df: pd.DataFrame, mp: dict, agent_id):
             
             # ساخت برچسب بازه تاریخ برای هر هفته با فرمت "X [ماه] تا" و "Y [ماه]" (بدون سال)
             def make_date_label(d_min, d_max):
-                if pd.isna(d_min) or pd.isna(d_max):
+                anchor_date = d_max if not pd.isna(d_max) else d_min
+                if pd.isna(anchor_date):
                     return None
                 try:
-                    from_str = to_jalali_day_month(d_min, persian_digits=True)  # فقط روز و ماه
-                    to_str = to_jalali_day_month(d_max, persian_digits=True)  # فقط روز و ماه
-                    # برگرداندن یک رشته با جداکننده خاص برای تقسیم بعدی
+                    wk_start, wk_end = shamsi_week_bounds(anchor_date, include_friday=False)
+                    from_str = to_jalali_day_month(wk_start, persian_digits=True)  # فقط روز و ماه
+                    to_str = to_jalali_day_month(wk_end, persian_digits=True)      # فقط روز و ماه
                     return f"START:{from_str}|END:{to_str}"
-                except:
+                except Exception:
                     return None
             
             agg["label"] = agg.apply(lambda row: make_date_label(row["date_min"], row["date_max"]), axis=1)
@@ -1042,8 +1525,10 @@ def compute_supervisor_daily(df: pd.DataFrame, mp: dict) -> pd.DataFrame:
     # ---- QC ناظران میدانی در سطح ردیف خام ----
     pq_col = mp.get("presence_q_daily")
     bq_col = mp.get("banner_q_daily")
+    pres_col = mp.get("presence_score")
+    edu_col  = mp.get("edu_score")
 
-    if pq_col or bq_col:
+    if pq_col or bq_col or pres_col or edu_col:
         def _row_field_q(x):
             vals = []
             if pq_col and pq_col in x:
@@ -1054,6 +1539,15 @@ def compute_supervisor_daily(df: pd.DataFrame, mp: dict) -> pd.DataFrame:
                 v = _to_pct_0_100(x[bq_col])
                 if v is not None:
                     vals.append(v)
+            # Presence/Education Score → برای QC ناظران میدانی (با نادیده گرفتن مقادیر خالی)
+            if pres_col and pres_col in x:
+                v = _to_pct_0_100(x[pres_col])
+                if v is not None:
+                    vals.append(v)
+            if edu_col and edu_col in x:
+                v = _to_pct_0_100(x[edu_col])
+                if v is not None:
+                    vals.append(v)
             if not vals:
                 return None
             return sum(vals) / len(vals)
@@ -1062,9 +1556,6 @@ def compute_supervisor_daily(df: pd.DataFrame, mp: dict) -> pd.DataFrame:
         df["_field_q_day"] = None
 
     # ---- QC راننده‌ها در سطح ردیف خام (میانگین حضور/آموزش) ----
-    pres_col = mp.get("presence_score")
-    edu_col  = mp.get("edu_score")
-
     if pres_col or edu_col:
         def _row_driver_q(x):
             vals = []
@@ -1214,37 +1705,112 @@ def _qc_driver_avg_to_label(avg_val) -> str:
     else:
         return "عالی"
 
-def compute_supervisor_overview_total(sup_day: pd.DataFrame) -> pd.DataFrame:
-    ov = (sup_day.groupby(["سرپرست","شهر"])
-          .agg(
-              Days=("تاریخ","nunique"),
-              Num_NoPart=("روزهای بدون مشارکت","sum"),
-              Num_Shift=("مشارکت با تاخیر","sum"),
-              Num_Incomp=("مشارکت‌های ناقص","sum"),
-              Num_Gold=("ساعات طلایی","sum"),
-              Num_Hours=("ساعات کاری کل","sum"),
-              Den_Assigned=("تخصیص داده شده","sum"),
-          ).reset_index())
-
-    d = ov["Den_Assigned"].replace(0, pd.NA)
-
-    nopart_rate = (ov["Num_NoPart"] / d) * 100
-    shift_rate  = (ov["Num_Shift"]  / d) * 100
-    inc_rate    = (ov["Num_Incomp"] / d) * 100
-    gold_rate   = (ov["Num_Gold"]   / d) * 100
-    avg_hours   = (ov["Num_Hours"]  / d)
-
+def compute_supervisor_overview_total(df_raw: pd.DataFrame, mp: dict) -> pd.DataFrame:
+    """
+    محاسبه نمای کلی هفته برای سرپرست‌ها مستقیماً از داده‌های خام.
+    متریک‌ها به‌صورت میانگین مستقیم از ستون‌های فایل اصلی محاسبه می‌شوند.
+    """
+    df = df_raw.copy()
+    
+    # اطمینان از وجود ستون تاریخ
+    if "_date" not in df.columns:
+        df["_date"] = parse_date_series(df[mp["date"]], mp.get("date_is_shamsi", False))
+    
+    # تبدیل ستون‌های مورد نیاز به عددی
+    cols_to_numeric = {}
+    if mp.get("total_hours"):
+        cols_to_numeric["total_hours"] = to_numeric_clean(df[mp["total_hours"]])
+    if mp.get("goldentime"):
+        cols_to_numeric["goldentime"] = to_numeric_clean(df[mp["goldentime"]])
+    if mp.get("shift_delay"):
+        cols_to_numeric["shift_delay"] = to_numeric_clean(df[mp["shift_delay"]])
+    if mp.get("absence"):
+        cols_to_numeric["absence"] = to_numeric_clean(df[mp["absence"]])
+    if mp.get("incomplete"):
+        cols_to_numeric["incomplete"] = to_numeric_clean(df[mp["incomplete"]])
+    
+    # ستون‌های سرپرست و شهر
+    supervisor_col = mp.get("supervisor")
+    city_col = mp.get("city")
+    
+    if not supervisor_col or not city_col:
+        # fallback: اگر ستون‌ها پیدا نشدند، از sup_day استفاده کنیم (برای سازگاری)
+        return pd.DataFrame(columns=["سرپرست", "شهر", "میانگین ساعات کاری", "مشارکت‌های ناقص", 
+                                      "مشارکت با تاخیر", "ساعات طلایی شیفت", "روزهای بدون مشارکت"])
+    
+    # ایجاد ستون‌های موقت عددی
+    if "total_hours" in cols_to_numeric:
+        df["_total_hours_num"] = cols_to_numeric["total_hours"]
+    if "goldentime" in cols_to_numeric:
+        df["_goldentime_num"] = cols_to_numeric["goldentime"]
+    if "shift_delay" in cols_to_numeric:
+        df["_shift_delay_num"] = cols_to_numeric["shift_delay"]
+    if "absence" in cols_to_numeric:
+        df["_absence_num"] = cols_to_numeric["absence"]
+    if "incomplete" in cols_to_numeric:
+        df["_incomplete_num"] = cols_to_numeric["incomplete"]
+    
+    # گروه‌بندی بر اساس سرپرست و شهر و محاسبه میانگین‌ها
+    agg_dict = {}
+    
+    if "_total_hours_num" in df.columns:
+        agg_dict["_total_hours_num"] = "mean"
+    
+    if "_goldentime_num" in df.columns:
+        agg_dict["_goldentime_num"] = "mean"
+    
+    if "_shift_delay_num" in df.columns:
+        agg_dict["_shift_delay_num"] = "mean"
+    
+    if "_absence_num" in df.columns:
+        agg_dict["_absence_num"] = "mean"
+    
+    if "_incomplete_num" in df.columns:
+        agg_dict["_incomplete_num"] = "mean"
+    
+    # تعداد روزهای منحصر به فرد
+    agg_dict["_date"] = "nunique"
+    
+    if not agg_dict:
+        return pd.DataFrame(columns=["سرپرست", "شهر"])
+    
+    # گروه‌بندی و تجمیع
+    ov = df.groupby([supervisor_col, city_col], dropna=False).agg(agg_dict).reset_index()
+    ov = ov.rename(columns={supervisor_col: "سرپرست", city_col: "شهر", "_date": "Days"})
+    
+    # فرمت‌دهی خروجی
     out = pd.DataFrame({
-        "میانگین ساعات کاری":  avg_hours.apply(lambda v: fmt_val(v, nd=2)),
-        "مشارکت‌های ناقص":    inc_rate.apply(lambda v: fmt_val(v, percent=True)),
-        "مشارکت با تاخیر":     shift_rate.apply(lambda v: fmt_val(v, percent=True)),
-        "ساعات طلایی شیفت":    gold_rate.apply(lambda v: fmt_val(v, percent=True)),
-        "روزهای بدون مشارکت": nopart_rate.apply(lambda v: fmt_val(v, percent=True)),
-        "actual assigned":    ov["Den_Assigned"],  # بعداً در رندر حذف می‌شود (UI فقط)
-        "سرپرست":             ov["سرپرست"],
-        "شهر":                ov["شهر"],
-        "Days":               ov["Days"],
+        "سرپرست": ov["سرپرست"],
+        "شهر": ov["شهر"],
+        "Days": ov.get("Days", 0),
     })
+    
+    # فرمت‌دهی متریک‌ها
+    if "_total_hours_num" in ov.columns:
+        out["میانگین ساعات کاری"] = ov["_total_hours_num"].apply(lambda v: fmt_val(v, nd=2))
+    
+    if "_goldentime_num" in ov.columns:
+        out["ساعات طلایی شیفت"] = ov["_goldentime_num"].apply(lambda v: fmt_val(v, percent=True))
+    
+    if "_shift_delay_num" in ov.columns:
+        out["مشارکت با تاخیر"] = ov["_shift_delay_num"].apply(lambda v: fmt_val(v, percent=True))
+    
+    if "_absence_num" in ov.columns:
+        out["روزهای بدون مشارکت"] = ov["_absence_num"].apply(lambda v: fmt_val(v, percent=True))
+    
+    if "_incomplete_num" in ov.columns:
+        out["مشارکت‌های ناقص"] = ov["_incomplete_num"].apply(lambda v: fmt_val(v, percent=True))
+    
+    # ستون actual assigned برای سازگاری (اگر نیاز بود)
+    if mp.get("actual_ts_excel") and mp["actual_ts_excel"] in df.columns:
+        assigned_sum = df.groupby([supervisor_col, city_col], dropna=False)[mp["actual_ts_excel"]].sum().reset_index()
+        assigned_sum = assigned_sum.rename(columns={supervisor_col: "سرپرست", city_col: "شهر"})
+        out = out.merge(assigned_sum[[mp["actual_ts_excel"], "سرپرست", "شهر"]], 
+                       on=["سرپرست", "شهر"], how="left")
+        out = out.rename(columns={mp["actual_ts_excel"]: "actual assigned"})
+    else:
+        out["actual assigned"] = 0
+    
     return out
 
 BASE_CSS = """
@@ -1385,24 +1951,29 @@ def df_to_html_table(df: pd.DataFrame, caption: str) -> str:
 
 def build_header_block(supervisor: str, city_display: str, date_from: str, date_to: str, logo_src: str | None = None) -> str:
     logo_html = f'<img src="{logo_src}" alt="logo" class="header-logo">' if logo_src else ""
+    yalda_text = '<span style="color: #d91b5c; font-weight: bold; font-size: 14px; margin-right: 8px;"></span>' if logo_src else ""
     return f"""
 <div class="header-line">
   <div class="info-grid" style="flex:1;">
     <div class="info-card"><span class="lbl">سرپرست:</span>{supervisor} — <span class="lbl">شهر:</span>{city_display} — <span class="lbl">تاریخ گزارش:</span>{date_from} تا {date_to}</div>
   </div>
-  {logo_html}
+  <div style="display: flex; align-items: center;">
+    {logo_html}
+    {yalda_text}
+  </div>
 </div>
 """
 
 def build_agent_date_block_shamsi(date_from_j: str, date_to_j: str, logo_src: str | None = None) -> str:
     logo_html = f'<img src="{logo_src}" alt="logo" style="height:36px;object-fit:contain;border-radius:8px;">' if logo_src else ""
+    yalda_text = '<span style="color: #d91b5c; font-weight: bold; font-size: 14px; margin-right: 8px;"></span>'
     return f"""
 <div class="sup-wrap">
   <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;margin:4px 0 10px;">
     <div class="info-grid" style="flex:1;">
       <div class="info-card"><span class="lbl">تاریخ گزارش:</span>{date_from_j} تا {date_to_j}</div>
     </div>
-    {f'<div style="padding:6px 10px;border:1px solid var(--border);border-radius:12px;background:#fff;box-shadow:var(--shadow)' + f'">{logo_html}</div>' if logo_src else ""}
+    {f'<div style="padding:6px 10px;border:1px solid var(--border);border-radius:12px;background:#fff;box-shadow:var(--shadow);display:flex;align-items:center;">{logo_html}{yalda_text}</div>' if logo_src else ""}
   </div>
 </div>
 """
@@ -1412,6 +1983,7 @@ def build_top10_html(city_label: str, top_df: pd.DataFrame, date_from_j: str, da
     df.insert(0, "رتبه", range(1, len(df) + 1))
     table_html = df_to_html_table(df, "")
     logo_html = f'<img src="{logo_src}" alt="logo" class="header-logo">' if logo_src else ""
+    yalda_text = '<span style="color: #d91b5c; font-weight: bold; font-size: 14px; margin-right: 8px;"></span>' if logo_src else ""
     header = f"""
       <div class=\"header-line\">
         <div class=\"info-grid\" style=\"flex:1;\">
@@ -1420,7 +1992,10 @@ def build_top10_html(city_label: str, top_df: pd.DataFrame, date_from_j: str, da
             <span class=\"lbl\">تاریخ گزارش:</span>{date_from_j} تا {date_to_j}
           </div>
         </div>
-        {logo_html}
+        <div style="display: flex; align-items: center;">
+          {logo_html}
+          {yalda_text}
+        </div>
       </div>
     """
     html = (
@@ -1685,7 +2260,6 @@ def build_card_html(
     last_week_val  = fmt_val(acq_last_week) if acq_last_week is not None else "-"
 
     qc_driver_lbl  = p.get("نمره QC راننده ها", "ok")
-    qc_field_lbl   = fmt_val(p.get("نمره QC ناظران میدانی"), percent=True)
 
     # --- helper برای تبدیل به ۰–۱ ---
     def _to_01(v):
@@ -1866,7 +2440,46 @@ def build_card_html(
         )
     else:
         field_qc_ul = ""
-
+    
+    # ---- تولید شعر یلدا بر اساس ضعف‌ها ----
+    # تشخیص بزرگترین ضعف
+    weakness_type = "general"
+    max_weakness_value = 0
+    
+    # بررسی روزهای بدون مشارکت
+    no_part_val = _to_num100(p.get("روزهای بدون مشارکت"))
+    if no_part_val and no_part_val > 20:
+        weakness_type = "absence"
+        max_weakness_value = no_part_val
+    
+    # بررسی مشارکت‌های ناقص
+    incomplete_val = _to_num100(p.get("مشارکت‌های ناقص"))
+    if incomplete_val and incomplete_val > max_weakness_value and incomplete_val > 15:
+        weakness_type = "incomplete"
+        max_weakness_value = incomplete_val
+    
+    # بررسی تاخیر
+    delay_val = _to_num100(p.get("مشارکت با تاخیر"))
+    if delay_val and delay_val > max_weakness_value and delay_val > 15:
+        weakness_type = "delay"
+        max_weakness_value = delay_val
+    
+    # بررسی راننده‌های فعال
+    drivers_pct = _to_num100(p.get("درصد راننده‌های فعال"))
+    if drivers_pct is not None and drivers_pct < 70:
+        weakness_type = "drivers"
+        max_weakness_value = 100 - drivers_pct
+    
+    # بررسی QC میدانی
+    if field_v and field_v != "-":
+        try:
+            field_val = float(field_v)
+            if field_val < 70:
+                weakness_type = "field_qc"
+                max_weakness_value = 100 - field_val
+        except (ValueError, TypeError):
+            pass
+    
     # ---- ساخت کارت ----
     return f"""
 {BASE_CSS}
@@ -1896,12 +2509,13 @@ def build_card_html(
         <div class="label">رتبه در شهر</div>
         <div class="value">{rank_city}</div>
       </div>
-      <div class="cell" style="flex:0 0 90px;">
+      <div class="cell" style="flex:0 0 auto; display: flex; align-items: center; gap: 8px;">
         {logo_html}
+        <span style="color: #d91b5c; font-weight: bold; font-size: 14px;"></span>
       </div>
     </div>
 
-    <!-- سطر ۲: متریک‌ها (بدون اکتیو و تطبیق) -->
+    <!-- سطر ۲: متریک‌ها (بدون اکتیو و تطبیق و بدون خوداظهاری اشتباه) -->
     <div class="row">
       <div class="cell">
         <div class="label">روزهای بدون مشارکت</div>
@@ -1919,10 +2533,6 @@ def build_card_html(
         <div class="label">مشارکت با تاخیر</div>
         <div class="value">{shift_delay}</div>
       </div>
-      <div class="cell">
-        <div class="label">خوداظهاری اشتباه</div>
-        <div class="value">{false_check}</div>
-      </div>
     </div>
 
     <!-- سطر ۳: QC -->
@@ -1931,11 +2541,6 @@ def build_card_html(
         <div class="label">نمره QC راننده ها</div>
         <div class="value">{qc_driver_lbl}</div>
         {driver_qc_ul}
-      </div>
-      <div class="cell">
-        <div class="label">نمره QC ناظران میدانی</div>
-        <div class="value">{qc_field_lbl}</div>
-        {field_qc_ul}
       </div>
       <div class="cell">
         <div class="label">TOTAL QC SCORE</div>
@@ -1984,6 +2589,52 @@ def html_download_button(filename: str, html_str: str, label: str):
     b64 = base64.b64encode(html_str.encode("utf-8")).decode()
     st.markdown(f'<a download="{filename}" href="data:text/html;base64,{b64}">{label}</a>', unsafe_allow_html=True)
 
+
+def html_to_fodt_bytes(title: str, html_str: str) -> bytes:
+    """Build a flat ODF (FODT) document without external libs, using plain text."""
+    # Normalize breaks for better readability
+    tmp = re.sub(r"(?i)<br\s*/?>", "\n", html_str)
+    tmp = re.sub(r"(?i)</p>", "\n\n", tmp)
+    tmp = re.sub(r"(?i)</div>", "\n", tmp)
+    tmp = re.sub(r"<[^>]+>", "", tmp)  # strip remaining tags
+    tmp = html_module.unescape(tmp)
+
+    def _paragraphs(text: str) -> list[str]:
+        paras = []
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line:
+                paras.append("<text:p><text:line-break/></text:p>")
+            else:
+                paras.append(f"<text:p>{html_module.escape(line)}</text:p>")
+        return paras or ["<text:p/>"]
+
+    body_xml = "\n".join(_paragraphs(tmp))
+    fodt = f"""<?xml version='1.0' encoding='UTF-8'?>
+<office:document xmlns:office='urn:oasis:names:tc:opendocument:xmlns:office:1.0'
+                 xmlns:text='urn:oasis:names:tc:opendocument:xmlns:text:1.0'
+                 xmlns:fo='urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0'
+                 office:version='1.2'>
+  <office:body>
+    <office:text>
+      <text:h text:outline-level='1'>{html_module.escape(title)}</text:h>
+      {body_xml}
+    </office:text>
+  </office:body>
+</office:document>
+"""
+    return fodt.encode("utf-8")
+
+
+def odf_download_button(filename: str, html_str: str, label: str, title: str = "گزارش"):
+    fodt_bytes = html_to_fodt_bytes(title, html_str)
+    b64 = base64.b64encode(fodt_bytes).decode()
+    st.markdown(
+        f"<a download='{filename}' href='data:application/vnd.oasis.opendocument.text;base64,{b64}'>{label}</a>",
+        unsafe_allow_html=True,
+    )
+
+
 def image_to_b64(file) -> str | None:
     if not file:
         return None
@@ -2022,6 +2673,54 @@ def _minmax(series: pd.Series):
 import math  # اگر بالاتر import نشده
 
 
+def _compute_score_for_group(group_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    محاسبه Score برای یک گروه خاص (مثلاً یک شهر یا یک تیم).
+    نرمال‌سازی APA در داخل همین گروه انجام می‌شود.
+    """
+    df = group_df.copy()
+    if df.empty:
+        df["Score"] = 0.0
+        df["_ACQ_rank"] = 0.0
+        df["_QC_component"] = 0.0
+        return df
+
+    # --- ۸۰٪: جذب به ازای روز کاری ---
+    # محاسبه APA و نرمال‌سازی آن به بازهٔ ۰–۱ (فقط در این گروه)
+    acq = pd.to_numeric(df.get("تعداد جذب"), errors="coerce")
+    wd  = pd.to_numeric(df.get("روزهای کاری"), errors="coerce")
+    # جلوگیری از تقسیم بر صفر
+    acq_per_day = acq / wd.replace(0, pd.NA)
+    df["_ACQ_rank"] = _minmax(acq_per_day).fillna(0.0)
+
+    # --- ۲۰٪: مؤلفه کیفیت بر اساس TOTAL QC SCORE ---
+    # نرمال‌سازی TOTAL QC SCORE بر اساس محدوده‌های گسسته
+    qc_component = pd.Series(0.0, index=df.index)
+    if "TOTAL QC SCORE" in df.columns:
+        tot_qc = pd.to_numeric(df["TOTAL QC SCORE"], errors="coerce")
+        def qc_map(x: float | int | None) -> float:
+            if pd.isna(x):
+                return 0.0
+            try:
+                val = float(x)
+            except Exception:
+                return 0.0
+            # تبدیل بر اساس محدوده‌ها
+            if val >= 80:
+                return 1.0  # 20/20
+            elif val >= 60:
+                return 0.5  # 10/20
+            elif val >= 50:
+                return 0.25  # 5/20
+            else:
+                return 0.0
+        qc_component = tot_qc.apply(qc_map)
+    df["_QC_component"] = qc_component
+
+    # ترکیب نهایی: ۸۰٪ جذب، ۲۰٪ کیفیت
+    df["Score"] = 0.8 * df["_ACQ_rank"] + 0.2 * df["_QC_component"]
+    return df
+
 def compute_agent_rank_score(stats: pd.DataFrame) -> pd.DataFrame:
     """
     ساخت امتیاز رتبه برای هر بازاریاب بر اساس منطق اصلاح‌شده:
@@ -2040,6 +2739,9 @@ def compute_agent_rank_score(stats: pd.DataFrame) -> pd.DataFrame:
       ترکیب می‌شود.
 
     نتیجهٔ نهایی (Score) برابر است با ۰٫۸ × (نمره نرمال‌شدهٔ جذب) + ۰٫۲ × (نمره نرمال‌شدهٔ کیفیت).
+    
+    توجه: این تابع نرمال‌سازی را روی کل داده‌ها انجام می‌دهد. برای رتبه‌بندی در گروه‌ها
+    (شهر یا تیم) از _compute_score_for_group استفاده کنید.
     """
     df = stats.copy()
     if df.empty:
@@ -2457,13 +3159,8 @@ def compute_total_qc_score_from_row(r: pd.Series) -> float:
     else:
         edu_score_pct = None
 
-    # اگر هر دو نمره QC راننده خالی بودند → دیفالت "متوسط" = 70%
-    if (pres_score_pct is None) and (edu_score_pct is None):
-        pres_score_pct = 70.0
-        edu_score_pct  = 70.0
-
-    s_pres_score = score_presence_score(pres_score_pct)   # max 5
-    s_edu_score  = score_education_score(edu_score_pct)   # max 10
+    s_pres_score = score_presence_score(pres_score_pct) if pres_score_pct is not None else None  # max 5
+    s_edu_score  = score_education_score(edu_score_pct) if edu_score_pct is not None else None   # max 10
 
     # --- وعده غیرواقعی (unreal) ---
     unreal_val = r.get("وعده ی غیرواقعی")
@@ -2503,23 +3200,162 @@ def compute_total_qc_score_from_row(r: pd.Series) -> float:
     s_activation   = score_activation(activation_pct)             # max 5
 
     # -------- جمع کل --------
-    # جمع کل امتیازها (شامل غیبت جدید):
+    # جمع کل امتیازها (شامل غیبت جدید و بدون متریک‌های biker مانند presence/banner):
     raw = (
         s_false + s_gold + s_hrs + s_sdl + s_inc + s_abs +    # 50 قدیمی + غیبت
-        s_banner_daily + s_banner_qual + s_presence_qual +    # 5+5+5
-        s_pres_score + s_edu_score +                          # 5+10
         s_unreal + s_tatbigh + s_activation                    # 10+5+5
     )
 
-    # حداکثر امتیاز تئوریک:
-    # متریک‌های قدیمی: 20 + 7 + 8 + 8 + 2 + 5 = 50
-    # متریک‌های جدید: 5 + 5 + 5 + 5 + 10 + 10 + 5 + 5 = 50
-    # جمع کل = 100
-    max_raw = 100.0
+    # حداکثر امتیاز تئوریک با لحاظ کردن ستون‌های موجود:
+    # از ۱۰۰ امتیاز، ۱۵ امتیاز مربوط به presenceQuality/banner/banner_daily حذف شده است.
+    max_raw = 85.0
+
+    if s_pres_score is not None:
+        raw += s_pres_score
+    else:
+        max_raw -= 5.0
+
+    if s_edu_score is not None:
+        raw += s_edu_score
+    else:
+        max_raw -= 10.0
 
     if max_raw <= 0:
         return 0.0
-    return round((raw / max_raw) * 100.0, 1)
+    return round((raw / max_raw) * 100.0, 3)
+
+
+def compute_total_qc_score_from_row_old(r: pd.Series) -> float:
+    """
+    نسخهٔ قدیمی محاسبه TOTAL QC SCORE که در آن متریک‌های biker
+    (presenceQuality_daily / bannerQuality_daily / banner_daily) نیز در امتیاز لحاظ می‌شوند.
+    از همان منطق امتیازدهی استفاده می‌کند ولی با حداکثر ۱۰۰ امتیاز.
+    """
+    # -------- متریک‌های قبلی --------
+    assigned   = r.get("تعداد فیلد های تخصیص داده شده", 0) or 0
+    work_days  = r.get("روزهای کاری", 0) or 0
+
+    false_count = r.get("خوداظهاری اشتباه", 0) or 0
+    shift_delay = r.get("مشارکت با تاخیر", 0) or 0
+    incomplete  = r.get("مشارکت‌های ناقص", 0) or 0
+
+    golden_val  = r.get("ساعات طلایی", 0) or 0
+    total_hours = r.get("ساعات کاری کل", 0) or 0
+
+    if work_days:
+        zero_golden_count = max(float(work_days) - float(golden_val), 0.0)
+    else:
+        zero_golden_count = 0.0
+
+    # درصد خوداظهاری اشتباه
+    if assigned and assigned != 0:
+        pct_false = 100.0 * float(false_count) / float(assigned)
+    else:
+        pct_false = 0.0
+
+    # میانگین ساعت کاری در روز
+    if work_days and work_days != 0:
+        avg_hours = float(total_hours) / float(work_days)
+    else:
+        avg_hours = 0.0
+
+    s_false = score_false_check(pct_false)           # max 20
+    s_gold  = score_goldentime(zero_golden_count)    # max 7
+    s_hrs   = score_total_work_hours(avg_hours)      # max 8
+    s_sdl   = score_shift_delay(shift_delay)         # max 8
+    s_inc   = score_incomplete(incomplete)           # max 2
+
+    # Absence (روزهای بدون مشارکت) → max 5
+    absence_val = r.get("روزهای بدون مشارکت", 0) or 0
+    s_abs   = score_absence_total(absence_val)       # max 5
+
+    # -------- متریک‌های جدید (QC راننده + QC ناظر + Tatbigh + Activation) --------
+    # ۱) ستون‌های ناظر میدانی (biker)
+    banner_qual_val = r.get("bannerQuality_daily")
+    if banner_qual_val is not None and not (hasattr(pd, "isna") and pd.isna(banner_qual_val)):
+        banner_qual_pct = _to_pct_0_100(banner_qual_val)
+    else:
+        banner_qual_pct = None
+    banner_daily_pct = banner_qual_pct
+
+    presence_qual_val = r.get("presenceQuality_daily")
+    if presence_qual_val is not None and not (hasattr(pd, "isna") and pd.isna(presence_qual_val)):
+        presence_qual_pct = _to_pct_0_100(presence_qual_val)
+    else:
+        presence_qual_pct = None
+
+    s_banner_daily  = score_banner_daily(banner_daily_pct)        # max 5
+    s_banner_qual   = score_banner_quality(banner_qual_pct)       # max 5
+    s_presence_qual = score_presence_quality(presence_qual_pct)   # max 5
+
+    # ۲) ستون‌های QC راننده‌ها
+    pres_score_val = r.get("نمره حضور توسط راننده ها")
+    if pres_score_val is not None and not (hasattr(pd, "isna") and pd.isna(pres_score_val)):
+        pres_score_pct = _to_pct_0_100(pres_score_val)
+    else:
+        pres_score_pct = None
+
+    edu_score_val = r.get("نمره آموزش توسط راننده ها")
+    if edu_score_val is not None and not (hasattr(pd, "isna") and pd.isna(edu_score_val)):
+        edu_score_pct = _to_pct_0_100(edu_score_val)
+    else:
+        edu_score_pct = None
+
+    s_pres_score = score_presence_score(pres_score_pct) if pres_score_pct is not None else None  # max 5
+    s_edu_score  = score_education_score(edu_score_pct) if edu_score_pct is not None else None   # max 10
+
+    # ۳) وعده غیرواقعی
+    unreal_val = r.get("وعده ی غیرواقعی")
+    if unreal_val is None or (hasattr(pd, "isna") and pd.isna(unreal_val)):
+        s_unreal = 10.0
+    else:
+        unreal_good = float(unreal_val)
+        if work_days and work_days > 0:
+            unreal_ratio = unreal_good / float(work_days)
+        else:
+            unreal_ratio = None
+        s_unreal = score_unreal_week(unreal_ratio, weight=10.0)
+
+    # ۴) Tatbigh
+    tatbigh_val = r.get("تطبیق")
+    if tatbigh_val is not None and not (hasattr(pd, "isna") and pd.isna(tatbigh_val)):
+        tatbigh_pct = _to_pct_0_100(tatbigh_val)
+    else:
+        tatbigh_pct = None
+    s_tatbigh   = score_tatbigh(tatbigh_pct)                      # max 5
+
+    # ۵) Activation
+    activation_val = r.get("درصد راننده‌های فعال")
+    if activation_val is None or (hasattr(pd, "isna") and pd.isna(activation_val)):
+        activation_val = r.get("فعال سازی")
+    if activation_val is not None and not (hasattr(pd, "isna") and pd.isna(activation_val)):
+        activation_pct = _to_pct_0_100(activation_val)
+    else:
+        activation_pct = None
+    s_activation   = score_activation(activation_pct)             # max 5
+
+    # -------- جمع کل قدیمی (با متریک‌های biker) --------
+    raw = (
+        s_false + s_gold + s_hrs + s_sdl + s_inc + s_abs +         # 50 قدیمی + غیبت
+        s_banner_daily + s_banner_qual + s_presence_qual +        # 5+5+5
+        s_unreal + s_tatbigh + s_activation                       # 10+5+5
+    )
+
+    max_raw = 100.0
+
+    if s_pres_score is not None:
+        raw += s_pres_score
+    else:
+        max_raw -= 5.0
+
+    if s_edu_score is not None:
+        raw += s_edu_score
+    else:
+        max_raw -= 10.0
+
+    if max_raw <= 0:
+        return 0.0
+    return round((raw / max_raw) * 100.0, 3)
 
 
 def compute_total_qc_score_details(r: pd.Series) -> dict:
@@ -2606,40 +3442,7 @@ def compute_total_qc_score_details(r: pd.Series) -> dict:
     }
 
     # -------- متریک‌های جدید --------
-    # اگر مقدار خالی بود، None بذار (نه 0) تا در میانگین نیفته
-    # banner_daily همان bannerQuality_daily است
-    banner_qual_val = r.get("bannerQuality_daily")
-    if banner_qual_val is not None and not (hasattr(pd, "isna") and pd.isna(banner_qual_val)):
-        banner_qual_pct = _to_pct_0_100(banner_qual_val)
-    else:
-        banner_qual_pct = None
-    banner_daily_pct = banner_qual_pct  # banner_daily همان bannerQuality_daily است
-    
-    presence_qual_val = r.get("presenceQuality_daily")
-    if presence_qual_val is not None and not (hasattr(pd, "isna") and pd.isna(presence_qual_val)):
-        presence_qual_pct = _to_pct_0_100(presence_qual_val)
-    else:
-        presence_qual_pct = None
-
-    s_banner_daily  = score_banner_daily(banner_daily_pct)
-    s_banner_qual   = score_banner_quality(banner_qual_pct)
-    s_presence_qual = score_presence_quality(presence_qual_pct)
-
-    details["banner_daily"] = {
-        "مقدار": f"{banner_daily_pct:.1f}%" if banner_daily_pct is not None else "ندارد",
-        "امتیاز": f"{s_banner_daily:.1f}",
-        "حداکثر": "5"
-    }
-    details["کیفیت بنر (bannerQuality)"] = {
-        "مقدار": f"{banner_qual_pct:.1f}%" if banner_qual_pct is not None else "ندارد",
-        "امتیاز": f"{s_banner_qual:.1f}",
-        "حداکثر": "5"
-    }
-    details["کیفیت حضور میدانی (presenceQuality)"] = {
-        "مقدار": f"{presence_qual_pct:.1f}%" if presence_qual_pct is not None else "ندارد",
-        "امتیاز": f"{s_presence_qual:.1f}",
-        "حداکثر": "5"
-    }
+    # متریک‌های biker مانند presenceQuality/banner دیگر در جزئیات کارت گزارش نمی‌شوند.
 
     # QC راننده‌ها
     # اگر مقدار خالی بود، None بذار (نه 0) تا در میانگین نیفته
@@ -2655,21 +3458,20 @@ def compute_total_qc_score_details(r: pd.Series) -> dict:
     else:
         edu_score_pct = None
 
-    if (pres_score_pct is None) and (edu_score_pct is None):
-        pres_score_pct = 70.0
-        edu_score_pct  = 70.0
+    s_pres_score = score_presence_score(pres_score_pct) if pres_score_pct is not None else None
+    s_edu_score  = score_education_score(edu_score_pct) if edu_score_pct is not None else None
 
-    s_pres_score = score_presence_score(pres_score_pct)
-    s_edu_score  = score_education_score(edu_score_pct)
+    pres_score_disp = f"{s_pres_score:.1f}" if s_pres_score is not None else "ندارد"
+    edu_score_disp  = f"{s_edu_score:.1f}" if s_edu_score is not None else "ندارد"
 
     details["نمره حضور توسط راننده‌ها"] = {
         "مقدار": f"{pres_score_pct:.1f}%" if pres_score_pct is not None else "ندارد",
-        "امتیاز": f"{s_pres_score:.1f}",
+        "امتیاز": pres_score_disp,
         "حداکثر": "5"
     }
     details["نمره آموزش توسط راننده‌ها"] = {
         "مقدار": f"{edu_score_pct:.1f}%" if edu_score_pct is not None else "ندارد",
-        "امتیاز": f"{s_edu_score:.1f}",
+        "امتیاز": edu_score_disp,
         "حداکثر": "10"
     }
 
@@ -2729,22 +3531,31 @@ def compute_total_qc_score_details(r: pd.Series) -> dict:
     }
 
     # -------- جمع کل --------
-    # مجموع امتیازات شامل متریک غیبت
+    # مجموع امتیازات شامل متریک غیبت و بدون متریک‌های biker (presence/banner)
     raw = (
         s_false + s_gold + s_hrs + s_sdl + s_inc + s_abs +
-        s_banner_daily + s_banner_qual + s_presence_qual +
-        s_pres_score + s_edu_score +
         s_unreal + s_tatbigh + s_activation
     )
 
-    # حداکثر امتیاز تئوریک با احتساب غیبت: ۵۰ (قدیمی + غیبت) + ۵۰ (جدید) = ۱۰۰
-    max_raw = 100.0
+    # از ۱۰۰ امتیاز، ۱۵ امتیاز مربوط به presenceQuality/banner/banner_daily حذف شده است.
+    max_raw = 85.0
+
+    if s_pres_score is not None:
+        raw += s_pres_score
+    else:
+        max_raw -= 5.0
+
+    if s_edu_score is not None:
+        raw += s_edu_score
+    else:
+        max_raw -= 10.0
+
     final_score = round((raw / max_raw) * 100.0, 1) if max_raw > 0 else 0.0
 
     # خلاصهٔ امتیازها
     details["_summary"] = {
         "جمع امتیازها": f"{raw:.1f}",
-        "حداکثر امتیاز": "100",
+        "حداکثر امتیاز": f"{max_raw:.0f}",
         "نمره نهایی": f"{final_score:.1f}"
     }
 
@@ -2862,29 +3673,50 @@ def _attach_weighted_score(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_top_performers(stats: pd.DataFrame, city: str | None, top_n: int = 10) -> pd.DataFrame:
-    # اول امتیاز رتبه را بر اساس منطق جدید محاسبه می‌کنیم
-    df = compute_agent_rank_score(stats)
+    # محاسبه امتیاز رتبه و رتبه در شهر
+    df = compute_city_scores_ranks(stats)
+    if df.empty:
+        return df
+    
+    # فقط کسانی که در شهر خودشان رتبه 1 هستند
+    df = df[df["CityRank"] == 1].copy()
+    
     if city and city != "همه":
         df = df[df["شهر"] == city].copy()
+    
     if df.empty:
         return df
 
+    # حذف ستون Score از لیست نمایش
     cols_show = [
         "آیدی","نام و نام خانوادگی","شهر","سرپرست","تیم‌ لید",
         "تعداد جذب","روزهای کاری","روزهای بدون مشارکت",
-        "نمره QC راننده ها","نمره QC ناظران میدانی","TOTAL QC SCORE","Score"
+        "نمره QC راننده ها","نمره QC ناظران میدانی","TOTAL QC SCORE"
     ]
     cols_show = [c for c in cols_show if c in df.columns]
-    out = df[cols_show].copy().sort_values("Score", ascending=False).head(top_n).reset_index(drop=True)
+    
+    # مرتب‌سازی بر اساس TOTAL QC SCORE (یا Score اگر موجود باشد) و محدود کردن به top_n
+    if "TOTAL QC SCORE" in df.columns:
+        out = df[cols_show].copy().sort_values("TOTAL QC SCORE", ascending=False).head(top_n).reset_index(drop=True)
+    else:
+        out = df[cols_show].copy().head(top_n).reset_index(drop=True)
 
     if "نمره QC ناظران میدانی" in out.columns:
         out["نمره QC ناظران میدانی"] = out["نمره QC ناظران میدانی"].apply(lambda v: fmt_val(v, percent=True))
-    out["Score"] = out["Score"].apply(lambda v: f"{v:.3f}")
+    
     return out
 
 
 def compute_city_scores_ranks(stats: pd.DataFrame) -> pd.DataFrame:
-    df = compute_agent_rank_score(stats)
+    """
+    محاسبه رنک شهر:
+    - ابتدا Score را برای کل داده‌ها یک‌بار محاسبه می‌کنیم (۸۰٪ جذب، ۲۰٪ TOTAL QC SCORE).
+    - سپس رنک تیم را هم حساب می‌کنیم.
+    - در نهایت، در هر شهر بر اساس Score (نزولی) و در صورت برابری، بر اساس TeamRank (صعودی) سورت می‌کنیم.
+      این باعث می‌شود اگر در یک تیم کسی بالاتر است، در شهر هم نسبت به هم‌تیمی‌اش بدتر نباشد.
+    """
+    # اول رنک تیم را حساب می‌کنیم تا TeamRank داشته باشیم (Score هم اینجا محاسبه می‌شود)
+    df = compute_team_scores_ranks(stats)
     if df.empty or "شهر" not in df.columns:
         df["CityRank"] = None
         df["CityCount"] = None
@@ -2892,50 +3724,58 @@ def compute_city_scores_ranks(stats: pd.DataFrame) -> pd.DataFrame:
 
     pieces = []
     for city, g in df.groupby("شهر", dropna=False):
-        gg = g.copy().sort_values("Score", ascending=False).reset_index(drop=True)
+        gg = g.copy()
+        # اگر TeamRank وجود نداشته باشد (به هر دلیل)، فقط بر اساس Score سورت می‌کنیم
+        if "TeamRank" in gg.columns:
+            gg = gg.sort_values(["Score", "TeamRank"], ascending=[False, True]).reset_index(drop=True)
+        else:
+            gg = gg.sort_values("Score", ascending=False).reset_index(drop=True)
         gg["CityRank"] = range(1, len(gg) + 1)
         gg["CityCount"] = gg["آیدی"].nunique()
         pieces.append(gg)
 
-    out = pd.concat(pieces, axis=0).reset_index(drop=True)
-    return out
-
-
+    return pd.concat(pieces, axis=0).reset_index(drop=True)
 
 def city_rank_for_id(stats: pd.DataFrame, agent_id: str | int) -> str | None:
     df = compute_city_scores_ranks(stats)
     row = df[df["آیدی"].astype(str) == str(agent_id)]
+    
+    # اگر ردیف پیدا نشد، خروجی None
     if row.empty:
         return None
+    
     r = row.iloc[0]
     try:
-        x = int(r["CityRank"]); y = int(r["CityCount"])
+        x = int(r["CityRank"])  # رتبه شهر
+        y = int(r["CityCount"])  # تعداد کل افراد در شهر
         return f"{x} از {y}"
     except Exception:
         return None
 
 
 def compute_team_scores_ranks(stats: pd.DataFrame) -> pd.DataFrame:
+    """
+    محاسبه رنک تیم: Score یکسان برای همه (نرمال‌سازی روی کل داده‌ها)،
+    سپس رنک تیم بر اساس همین Score یکسان محاسبه می‌شود.
+    این تضمین می‌کند که اگر فردی Score بالاتری دارد، در تیم هم رتبه بهتری داشته باشد.
+    """
+    # محاسبه Score یکسان برای همه (نرمال‌سازی روی کل داده‌ها)
     df = compute_agent_rank_score(stats)
-    # ستون سرپرست ممکن است با کاراکترهای عجیبی ذخیره شده باشد؛ سعی می‌کنیم هر دو را پوشش دهیم
-    col_sup = "سرپرست"
-    if col_sup not in df.columns and "सरपरست" in df.columns:
-        col_sup = "सरपरست"
-
-    if df.empty or col_sup not in df.columns:
+    col_sup = "سرپرست" if "سرپرست" in df.columns else None
+    if df.empty or col_sup is None:
         df["TeamRank"] = None
         df["TeamCount"] = None
         return df
 
     pieces = []
     for sup, g in df.groupby(col_sup, dropna=False):
+        # رنک تیم بر اساس Score یکسان (که قبلاً محاسبه شده)
         gg = g.copy().sort_values("Score", ascending=False).reset_index(drop=True)
         gg["TeamRank"] = range(1, len(gg) + 1)
         gg["TeamCount"] = gg["آیدی"].nunique()
         pieces.append(gg)
 
-    out = pd.concat(pieces, axis=0).reset_index(drop=True)
-    return out
+    return pd.concat(pieces, axis=0).reset_index(drop=True)
 
 
 
@@ -2946,7 +3786,8 @@ def team_rank_for_id(stats: pd.DataFrame, agent_id: str | int) -> str | None:
         return None
     r = row.iloc[0]
     try:
-        x = int(r["TeamRank"]); y = int(r["TeamCount"])
+        x = int(r["TeamRank"])
+        y = int(r["TeamCount"])
         return f"{x} از {y}"
     except Exception:
         return None
@@ -2977,23 +3818,8 @@ uploaded = st.file_uploader("فایل اکسل را انتخاب کنید", type
 if uploaded:
     df_raw = load_excel(uploaded)
     mp = find_column_mapping(df_raw)
-
-    # --- خروجی QC برای مهر ---
-    qc_mehr = export_qc_last_record_for_month(df_raw, mp, 7, 1404, "QC_Mehr_1404.xlsx")
-
-    # --- خروجی QC برای آبان ---
-    qc_aban = export_qc_last_record_for_month(df_raw, mp, 8, 1404, "QC_Aban_1404.xlsx")
-
-    # نمایش در Streamlit
-    st.write("📌 QC مهر 1404:")
-    st.dataframe(qc_mehr)
-
-    st.write("📌 QC آبان 1404:")
-    st.dataframe(qc_aban)
-
-    # باقی کد شما
-    dates = pd.to_datetime(df_raw[mp["date"]], errors="coerce").dropna()
-    default_anchor = dates.max().date() if not dates.empty else datetime.today().date()
+    dates = parse_date_series(df_raw[mp["date"]], mp.get("date_is_shamsi", False)).dropna()
+    default_anchor = dates.max() if not dates.empty else datetime.today().date()
 
     col1, col2 = st.columns([1,1], gap="medium")
     with col1:
@@ -3008,19 +3834,22 @@ if uploaded:
     # === ساخت df7 بر اساس مبنا ===
     if basis == "Anchor انتخابی":
         # یک پنجرهٔ ۷روزه حول Anchor برای همه
-        df_raw["_date"] = pd.to_datetime(df_raw[mp["date"]], errors="coerce").dt.date
+        df_raw["_date"] = parse_date_series(df_raw[mp["date"]], mp.get("date_is_shamsi", False))
         df7 = filter_last_7_days(
             df_raw,
             mp["date"],
-            anchor_date=datetime.combine(anchor, datetime.min.time())
+            anchor_date=datetime.combine(anchor, datetime.min.time()),
+            date_is_shamsi=mp.get("date_is_shamsi", False),
         )
     else:
         # آخرین هفتهٔ موجود برای هر شهر (حداکثر تاریخ هر شهر → ۶ روز قبلش)
-        df_raw["_date"] = pd.to_datetime(df_raw[mp["date"]], errors="coerce").dt.date
+        df_raw["_date"] = parse_date_series(df_raw[mp["date"]], mp.get("date_is_shamsi", False))
         if mp.get("city"):
-            df7 = filter_last_7_days_per_group(df_raw, mp["date"], mp["city"])
+            df7 = filter_last_7_days_per_group(
+                df_raw, mp["date"], mp["city"], date_is_shamsi=mp.get("date_is_shamsi", False)
+            )
         else:
-            df7 = filter_last_7_days(df_raw, mp["date"])
+            df7 = filter_last_7_days(df_raw, mp["date"], date_is_shamsi=mp.get("date_is_shamsi", False))
 
     if df7.empty:
         st.warning("برای این بازهٔ ۷ روزه داده‌ای پیدا نشد. مبنای تاریخ یا Anchor را تغییر دهید.")
@@ -3032,28 +3861,40 @@ if uploaded:
         st.caption(f"شهرهای یافت شده: {', '.join(map(str, unique_cities))}")
 
     # === تاریخ مرجع یکسان برای همهٔ خروجی‌ها از خودِ df7 ===
+    # مرجع اولیه بر اساس کل df7
     _from_g_ref = pd.to_datetime(pd.Series(df7["_date"])).min().date()
     _to_g_ref   = pd.to_datetime(pd.Series(df7["_date"])).max().date()
-    from_j_ref  = to_jalali_words(_from_g_ref, persian_digits=True)
-    to_j_ref    = to_jalali_words(_to_g_ref,   persian_digits=True)
 
-    # === مرجع یکسان: آخرین هفته‌ی موجود در کل داده (week max) ===
+    # === مرجع یکسان: آخرین هفته‌ی موجود در کل داده (week max) → تراز به هفتهٔ شمسی (شنبه تا پنجشنبه) ===
     if mp.get("week") and mp["week"] in df7.columns:
         _wk_series = pd.to_numeric(df7[mp["week"]], errors="coerce")
         max_week = _wk_series.max()
         df_week_latest = df7[_wk_series == max_week].copy()
 
-        # تاریخ مرجع = آخرین روزِ دیتای همین هفته
-        _to_g_ref = pd.to_datetime(df_week_latest["_date"]).max().date()
-        # همیشه بازه‌ی ۷ روزه نشان بده، حتی اگر فقط یک روز داده داریم
-        _from_g_ref = _to_g_ref - timedelta(days=6)
+        # تاریخ مرجع = آخرین روزِ دیتای همین هفته، سپس تراز به شنبه/پنج‌شنبه
+        _anchor_g = pd.to_datetime(df_week_latest["_date"]).max().date()
     else:
         # fallback اگر ستون week نداشتیم
-        _to_g_ref   = pd.to_datetime(pd.Series(df7["_date"])).max().date()
-        _from_g_ref = _to_g_ref - timedelta(days=6)
+        _anchor_g = pd.to_datetime(pd.Series(df7["_date"])).max().date()
 
+    _from_g_ref, _to_g_ref = shamsi_week_bounds(_anchor_g, include_friday=False)
     from_j_ref = to_jalali_words(_from_g_ref, persian_digits=True)
     to_j_ref   = to_jalali_words(_to_g_ref,   persian_digits=True)
+
+    # ✅ «هفتهٔ مرجع رنکینگ» = همان بازه‌ای که روی گزارش/کارنامه نشان می‌دهیم
+    # همهٔ محاسبات رتبه (شهر / تیم) و آمار عملکرد بازاریاب‌ها/سرپرست‌ها
+    # بر اساس همین بازهٔ ثابت (_from_g_ref تا _to_g_ref) انجام می‌شود.
+    df_week = df7.copy()
+    try:
+        df_week["_date"] = pd.to_datetime(df_week["_date"], errors="coerce").dt.date
+        mask_week = (df_week["_date"] >= _from_g_ref) & (df_week["_date"] <= _to_g_ref)
+        df_week = df_week[mask_week]
+        # اگر به هر دلیل فیلتر خالی شد، برگردیم به df7 تا برنامه از کار نیفتد.
+        if df_week.empty:
+            df_week = df7.copy()
+    except Exception:
+        # در صورت خطا هم از df7 (۷ روز اخیر) استفاده می‌کنیم.
+        df_week = df7.copy()
 
     # ======== MODE 1: Agent Cards ========
     if mode == "کارت بازاریاب":
@@ -3068,7 +3909,8 @@ if uploaded:
         from_j = to_jalali_words(_from_g, persian_digits=True)
         to_j   = to_jalali_words(_to_g,   persian_digits=True)
 
-        stats = compute_weekly_stats(df7, mp)
+        # ⚖️ منطق رنک (شهر/تیم) و آمار کارت‌ها فقط بر اساس «هفتهٔ مرجع» محاسبه می‌شود
+        stats = compute_weekly_stats(df_week, mp)
 
         # ✅ میانگین کلی TOTAL QC SCORE در همین بازه
         mean_qc = None
@@ -3082,6 +3924,70 @@ if uploaded:
         with st.expander("خلاصهٔ بازاریاب‌ها (اختیاری)", expanded=False):
             st.dataframe(stats, use_container_width=True)
 
+        # --- دانلود Excel نمره‌های QC هفتگی ---
+        spacer(12)
+        st.markdown("---")
+        st.subheader("📊 دانلود Excel نمره‌های QC هفتگی")
+        with st.expander("📊 دانلود Excel نمره‌های QC هفتگی هر بازاریاب", expanded=True):
+            st.info("این گزارش نمره TOTAL QC SCORE و سایر متریک‌ها را برای هر بازاریاب به تفکیک هفته نمایش می‌دهد.")
+            
+            if st.button("📥 تولید و دانلود Excel نمره‌های هفتگی", type="primary"):
+                with st.spinner("در حال محاسبه نمره‌های QC هفتگی..."):
+                    try:
+                        # استفاده از df_raw برای تمام داده‌ها (نه فقط 7 روز اخیر)
+                        df_raw["_date"] = parse_date_series(df_raw[mp["date"]], mp.get("date_is_shamsi", False))
+                        weekly_stats = compute_weekly_stats_by_week(df_raw, mp)
+                        
+                        if weekly_stats.empty:
+                            st.warning("هیچ داده‌ای برای محاسبه نمره‌های هفتگی پیدا نشد. مطمئن شوید که ستون 'week' در فایل اکسل وجود دارد.")
+                        else:
+                            # انتخاب ستون‌های مهم برای نمایش
+                            important_cols = [
+                                "آیدی", "نام و نام خانوادگی", "شهر", "سرپرست", "هفته",
+                                "تعداد جذب", "روزهای کاری", "TOTAL QC SCORE",
+                                "نمره QC راننده ها", "نمره QC ناظران میدانی",
+                                "روزهای بدون مشارکت", "مشارکت‌های ناقص", "مشارکت با تاخیر",
+                                "خوداظهاری اشتباه", "ساعات طلایی", "ساعات کاری کل"
+                            ]
+                            
+                            # فقط ستون‌هایی که وجود دارند
+                            display_cols = [c for c in important_cols if c in weekly_stats.columns]
+                            # اضافه کردن سایر ستون‌ها
+                            other_cols = [c for c in weekly_stats.columns if c not in display_cols]
+                            final_cols = display_cols + other_cols
+                            
+                            result_df = weekly_stats[final_cols].copy()
+                            
+                            # مرتب‌سازی
+                            result_df = result_df.sort_values(["آیدی", "هفته"]).reset_index(drop=True)
+                            
+                            # نمایش پیش‌نمایش
+                            st.success(f"✅ گزارش برای {len(result_df)} ردیف (هفته-بازاریاب) آماده شد!")
+                            st.dataframe(result_df.head(20), use_container_width=True)
+                            if len(result_df) > 20:
+                                st.caption(f"نمایش 20 ردیف اول از {len(result_df)} ردیف. تمام داده‌ها در فایل Excel موجود است.")
+                            
+                            # آماده‌سازی برای دانلود
+                            from io import BytesIO
+                            output = BytesIO()
+                            with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                                result_df.to_excel(writer, index=False, sheet_name='نمره‌های QC هفتگی')
+                            
+                            output.seek(0)
+                            
+                            # نام فایل
+                            filename = f"نمره_QC_هفتگی_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+                            
+                            # دکمه دانلود
+                            st.download_button(
+                                label="📥 دانلود فایل Excel",
+                                data=output.getvalue(),
+                                file_name=filename,
+                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                            )
+                    except Exception as e:
+                        st.error(f"خطا در محاسبه گزارش: {str(e)}")
+                        st.exception(e)
 
         # --- Top 10 – تنظیمات (اختیاری) ---
         with st.expander("Top 10 – تنظیمات (اختیاری)", expanded=False):
@@ -3230,69 +4136,57 @@ if uploaded:
                     else:
                         person["تعداد راننده‌های فعال"] = None
                         person["درصد راننده‌های فعال"] = None
-                    
-                    # ✅ محاسبه نقص مدارک: مجموع مقادیر هر ستون نقص مدارک طی ۴ هفته اخیر
-                    doc_issue_cols_present = [col for col in DOC_ISSUE_COLS if col in df_agent_4weeks.columns]
-                    if doc_issue_cols_present:
-                        # جمع کل نقص‌ها در تمام ستون‌ها
-                        total_doc_issues = 0.0
-                        for col in doc_issue_cols_present:
-                            try:
-                                col_numeric = to_numeric_clean(df_agent_4weeks[col])
-                                col_sum = col_numeric.sum()
-                            except Exception:
-                                col_sum = 0
-                            # اگر NaN باشد، به‌عنوان ۰ در نظر بگیریم
-                            if pd.isna(col_sum):
-                                col_sum = 0
-                            # ذخیره مقدار جمع‌شده برای هر ستون در person (برای بولت‌پوینت)
-                            person[col] = col_sum
-                            # فقط مقادیر مثبت را در جمع کل لحاظ می‌کنیم
-                            try:
-                                if float(col_sum) > 0:
-                                    total_doc_issues += float(col_sum)
-                            except Exception:
-                                pass
-                        # تعداد نقص مدارک = جمع مقادیر مثبت در تمام ستون‌ها
-                        person["تعداد نقص مدارک"] = total_doc_issues if total_doc_issues > 0 else 0
-                    else:
-                        person["تعداد نقص مدارک"] = None
-
-                    # ✅ محاسبه درصد نقص مدارک بر اساس نسبت تعداد نقص مدارک به مجموع جذب در همین ۴ هفته
-                    # به جای استفاده از ستون Tatbigh، درصد نقص مدارک را خودمان محاسبه می‌کنیم.
-                    try:
-                        # محاسبه مجموع جذب این ۴ هفته
-                        acq_sum_for_doc = None
-                        if mp.get("acq") and mp["acq"] in df_agent_4weeks.columns:
-                            acq_sum_for_doc = to_numeric_clean(df_agent_4weeks[mp["acq"]]).sum()
-                        total_docs = person.get("تعداد نقص مدارک")
-                        # اگر مقدار جذب و تعداد نقص مدارک موجود بود
-                        if acq_sum_for_doc is not None and acq_sum_for_doc > 0 and total_docs is not None:
-                            person["درصد نقص مدارک"] = (float(total_docs) / float(acq_sum_for_doc)) * 100
-                        else:
-                            # اگر داده جذب وجود نداشت یا صفر بود، درصورت وجود نقص مدارک درصد را صفر یا None قرار بده
-                            if total_docs is not None and float(total_docs) == 0:
-                                person["درصد نقص مدارک"] = 0
-                            else:
-                                person["درصد نقص مدارک"] = None
-                    except Exception:
-                        # در صورت خطا، درصد را None قرار بده
-                        person["درصد نقص مدارک"] = None
                 else:
                     person["تعداد راننده‌های فعال"] = None
                     person["درصد راننده‌های فعال"] = None
-                    person["تعداد نقص مدارک"] = None
-                    person["درصد نقص مدارک"] = None
             else:
                 person["تعداد راننده‌های فعال"] = None
                 person["درصد راننده‌های فعال"] = None
-                person["تعداد نقص مدارک"] = None
-                person["درصد نقص مدارک"] = None
         else:
             person["تعداد راننده‌های فعال"] = None
             person["درصد راننده‌های فعال"] = None
-            person["تعداد نقص مدارک"] = None
-            person["درصد نقص مدارک"] = None
+
+        # ✅ تعداد و درصد نقص مدارک از stats (که بر اساس جذب هفته‌ای محاسبه شده) می‌آید
+        # اما برای جزئیات هر ستون (بولت‌پوینت‌ها)، باید از همان بازه هفتگی استفاده کنیم
+        
+        # پیدا کردن هفته(های) مورد استفاده برای این آیدی
+        # برای محاسبه جزئیات، از همان بازه‌ای استفاده می‌کنیم که در stats استفاده شده
+        _id_series_all = df_raw[mp["id"]].astype(str).str.strip()
+        df_agent_weekly = df_raw[_id_series_all == str(sel_id).strip()].copy()
+        
+        # اگر ستون week وجود دارد، از آن استفاده می‌کنیم
+        if mp.get("week") and mp["week"] in df_agent_weekly.columns:
+            # پیدا کردن هفته(های) موجود در df7 برای این آیدی
+            _id_series_df7 = df7[mp["id"]].astype(str).str.strip()
+            df_agent_in_df7 = df7[_id_series_df7 == str(sel_id).strip()].copy()
+            
+            if not df_agent_in_df7.empty and mp["week"] in df_agent_in_df7.columns:
+                # هفته‌های موجود در df7
+                weeks_in_df7 = to_numeric_clean(df_agent_in_df7[mp["week"]]).dropna().unique().tolist()
+                
+                if weeks_in_df7:
+                    # فیلتر کردن داده‌های هفته‌ای برای همین هفته‌ها
+                    df_agent_weekly["_week_num"] = to_numeric_clean(df_agent_weekly[mp["week"]])
+                    df_agent_weekly = df_agent_weekly[df_agent_weekly["_week_num"].isin(weeks_in_df7)]
+                    
+                    # Unique کردن بر اساس آیدی و هفته
+                    df_agent_weekly = df_agent_weekly.drop_duplicates(subset=[mp["id"], mp["week"]], keep='first')
+                    
+                    # محاسبه جزئیات هر ستون نقص مدارک از بازه هفته‌ای
+                    doc_issue_cols_present = [col for col in DOC_ISSUE_COLS if col in df_agent_weekly.columns]
+                    if doc_issue_cols_present:
+                        for col in doc_issue_cols_present:
+                            try:
+                                col_numeric = to_numeric_clean(df_agent_weekly[col])
+                                col_sum = col_numeric.sum()
+                                if pd.isna(col_sum):
+                                    col_sum = 0
+                                person[col] = float(col_sum) if col_sum > 0 else 0
+                            except Exception:
+                                person[col] = 0
+        
+        # تعداد و درصد نقص مدارک از person (که از stats آمده) استفاده می‌شود
+        # این مقادیر قبلاً در compute_weekly_stats بر اساس جذب هفته‌ای محاسبه شده‌اند
 
         # فقط داده‌های همین آیدی در df7 برای نمایش تاریخ کارت (با strip برای مچ‌شدن امن)
         _id_series = df7[mp["id"]].astype(str).str.strip()
@@ -3302,10 +4196,10 @@ if uploaded:
             st.warning("برای این آیدی در بازهٔ ۷ روز اخیر داده‌ای پیدا نشد.")
             st.stop()
 
-        # ⛔️ مهم: بازهٔ ۷ روز اخیر را بر اساس max تاریخِ همین آیدی clamp کن (فقط برای نمایش تاریخ کارت)
+        # ⛔️ مهم: بازهٔ نمایشی کارت = هفتهٔ شمسی (شنبه تا پنجشنبه) بر اساس آخرین تاریخ همین آیدی
         _dates_agent = pd.to_datetime(df_agent["_date"], errors="coerce")
-        _to_g_sel = _dates_agent.max().date()
-        _from_g_sel = (_to_g_sel - timedelta(days=6))
+        _anchor_sel = _dates_agent.max().date()
+        _from_g_sel, _to_g_sel = shamsi_week_bounds(_anchor_sel, include_friday=False)
 
         from_j_sel = to_jalali_words(_from_g_sel, persian_digits=True)
         to_j_sel   = to_jalali_words(_to_g_sel,   persian_digits=True)
@@ -3328,8 +4222,55 @@ if uploaded:
         # کارت + دانلود HTML با تاریخ درست همان آیدی
         card_html = build_card_html(person, from_j_sel, to_j_sel, logo_src=logo_b64, rank_text=rank_text, team_rank_text=team_rank_text, acq_chart_src=chart_src, acq_recent3_total=recent4, acq_last_week=last_week_acq)
         html_download_button(f"card_{person.get('آیدی','agent')}.html", card_html, "دانلود HTML همین کارت")
+        odf_download_button(
+            f"card_{person.get('آیدی','agent')}.fodt",
+            card_html,
+            "دانلود ODF همین کارت (متن ساده)",
+            title=f"کارت بازاریاب {person.get('نام', '')}",
+        )
         st.components.v1.html(card_html, height=600, scrolling=True)
 
+        # === دیباگ درصد نقص مدارک ===
+        spacer(12)
+        with st.expander("🔍 دیباگ محاسبه درصد نقص مدارک", expanded=False):
+            st.write("**مقادیر خام از stats:**")
+            doc_count_raw = person.get("تعداد نقص مدارک")
+            acq_count_raw = person.get("تعداد جذب")
+            pct_raw = person.get("درصد نقص مدارک")
+            
+            st.write(f"- تعداد نقص مدارک: `{doc_count_raw}`")
+            st.write(f"- تعداد جذب: `{acq_count_raw}`")
+            st.write(f"- درصد نقص مدارک (خام): `{pct_raw}`")
+            
+            if doc_count_raw is not None and acq_count_raw is not None:
+                try:
+                    doc_num = float(doc_count_raw)
+                    acq_num = float(acq_count_raw)
+                    if acq_num > 0:
+                        calculated_pct = (doc_num / acq_num) * 100
+                        st.write(f"- محاسبه دستی: ({doc_num} / {acq_num}) * 100 = **{calculated_pct:.2f}%**")
+                        if pct_raw is not None:
+                            pct_num = float(pct_raw)
+                            if abs(pct_num - calculated_pct) > 0.01:
+                                st.warning(f"⚠️ تفاوت وجود دارد! مقدار در stats: {pct_num:.2f}% ولی محاسبه دستی: {calculated_pct:.2f}%")
+                except Exception as e:
+                    st.error(f"خطا در محاسبه: {e}")
+            
+            # بررسی ستون‌های نقص مدارک
+            st.write("**ستون‌های نقص مدارک (جزئیات):**")
+            doc_detail_dict = {}
+            for col in DOC_ISSUE_COLS:
+                if col in person:
+                    doc_detail_dict[col] = person.get(col)
+            if doc_detail_dict:
+                st.json(doc_detail_dict)
+                total_from_details = sum(float(v) if v is not None else 0 for v in doc_detail_dict.values())
+                st.write(f"- مجموع از جزئیات: **{total_from_details}**")
+                if doc_count_raw is not None:
+                    doc_num = float(doc_count_raw)
+                    if abs(total_from_details - doc_num) > 0.01:
+                        st.warning(f"⚠️ تفاوت! مجموع جزئیات: {total_from_details} ولی تعداد نقص مدارک: {doc_num}")
+        
         # === جزئیات TOTAL QC SCORE ===
         spacer(12)
         with st.expander("📊 جزئیات محاسبه TOTAL QC SCORE", expanded=False):
@@ -3393,152 +4334,52 @@ if uploaded:
                     st.dataframe(df_cat, use_container_width=True, hide_index=True)
                 st.markdown("")
 
-        # === Weekly 4-week trend chart (Altair) ===
-        spacer(12)
-        st.markdown(
-        """
-        <div style='background:linear-gradient(90deg,#2563eb,#06b6d4);
-            color:white;padding:10px 16px;border-radius:10px;
-            font-weight:700;font-size:16px;margin-bottom:8px;'>
-        📈 ترند ۴ هفته‌ای متریک‌ها (درصد نسبت به تخصیص)
-        </div>
-        """,
-        unsafe_allow_html=True
-        )
-        spacer(6)
-
-        if not mp.get("week"):
-            st.error("ستون «week» پیدا نشد. اگر نامش متفاوت است، در find_column_mapping آن را مپ کن (مثلاً 'هفته').")
-        else:
-            # ❗️ترند را از df_raw بگیر (نه df7) تا ۴ هفتهٔ آخر واقعی محاسبه شود
-            df_trend = compute_weekly_rates_for_agent(df_raw, mp, sel_id)
-
-            if not _ALT_OK:
-                st.warning("Altair نصب نیست. برای فعال شدن نمودار اجرا کن: pip install altair vega_datasets")
-
-            if df_trend.empty:
-                st.info("برای این آیدی دیتای معتبر ۴ هفته‌ای پیدا نشد (week/assigned را چک کن).")
-            else:
-                df_trend["week"] = pd.to_numeric(df_trend["week"], errors="coerce")
-                df_trend = df_trend.dropna(subset=["week","value"])
-                if not df_trend.empty and _ALT_OK:
-                    try:
-                        color_scale = alt.Scale(
-                            domain=[
-                                "روزهای بدون مشارکت",
-                                "مشارکت‌های ناقص",
-                                "مشارکت با تاخیر",
-                                "ساعات طلایی شیفت",
-                                "مشارکت خارج از محدوده مجاز",
-                                "خوداظهاری اشتباه",
-                            ],
-                            range=["#ef4444","#f97316","#facc15","#22c55e","#3b82f6","#a855f7"]
-                        )
-                        chart = (
-                            alt.Chart(df_trend)
-                               .mark_line(point=True, strokeWidth=2)
-                               .encode(
-                                   x=alt.X("week:O", sort="descending", title="هفته"),
-                                   y=alt.Y("value:Q", title="درصد (%)"),
-                                   color=alt.Color("metric:N", title="متریک", scale=color_scale,
-                                                   legend=alt.Legend(orient="bottom")),
-                                   tooltip=[
-                                       alt.Tooltip("metric:N", title="متریک"),
-                                       alt.Tooltip("week:O", title="هفته"),
-                                       alt.Tooltip("value:Q", title="درصد", format=".1f")
-                                   ]
-                               )
-                               .properties(height=320)
-                        )
-                        text = (
-                            alt.Chart(df_trend)
-                               .mark_text(align='center', dy=-10, fontSize=11)
-                               .encode(
-                                   x=alt.X('week:O', sort="descending"),
-                                   y='value:Q',
-                                   text=alt.Text('value:Q', format='.0f'),
-                                   color=alt.Color('metric:N', legend=None)
-                               )
-                        )
-                        mean_line = alt.Chart(df_trend).mark_rule(color='gray', strokeDash=[4,4]).encode(
-                            y='mean(value):Q'
-                        )
-                        chart = (chart + text + mean_line).configure_view(strokeWidth=0, fill="#fafafa").configure_axis(
-                            grid=True, gridColor="#e5e7eb", labelFontSize=12, titleFontSize=13
-                        )
-
-                        st.altair_chart(chart, use_container_width=True)
-                    except Exception as e:
-                        st.warning(f"Altair خطا داد: {e}")
-
-            with st.expander("جدول مبنای نمودار", expanded=False):
-                st.dataframe(df_trend, use_container_width=True)
-
-        spacer(8)
-        st.markdown("---")
 
 
 
-        # --- Batch download by city (collapsed) ---
+        # --- دانلود کارت‌ها بر اساس شهر و سرپرست ---
         with st.expander("دانلود کارت‌ها بر اساس شهر و سرپرست (اختیاری)", expanded=False):
-            cities = ["همه"] + sorted(stats["شهر"].dropna().unique())
-            sel_city = st.selectbox("شهر:", cities, index=0)
-
-            # فهرست سرپرست‌ها بر اساس شهر انتخاب‌شده
-            sup_src = stats if sel_city == "همه" else stats[stats["شهر"] == sel_city]
-            supervisors = ["همه"] + sorted(sup_src["سرپرست"].dropna().unique())
-            sel_sup = st.selectbox("سرپرست:", supervisors, index=0)
-
-            batch_size = st.number_input("تعداد در هر دسته", min_value=1, max_value=200, value=10, step=1)
-
-            # اعمال فیلتر شهر/سرپرست
-            subset = stats.copy()
-            if sel_city != "همه":
-                subset = subset[subset["شهر"] == sel_city]
-            if sel_sup != "همه":
-                subset = subset[subset["سرپرست"] == sel_sup]
-
-            total_n = len(subset)
-            if total_n == 0:
-                st.info("برای این فیلتر کارت فعالی وجود ندارد.")
+            st.info("برای هر ترکیب شهر/سرپرست، یک فایل HTML شامل تمام بازاریاب‌های آن سرپرست ساخته می‌شود.")
+            
+            # محاسبه رتبه‌ها یک بار برای همه
+            city_ranks_df = compute_city_scores_ranks(stats)
+            team_ranks_df = compute_team_scores_ranks(stats)
+            
+            # پیدا کردن تمام ترکیبات شهر/سرپرست
+            city_sup_combinations = stats.groupby(["شهر", "سرپرست"], dropna=False).size().reset_index(name="count")
+            city_sup_combinations = city_sup_combinations.sort_values(["شهر", "سرپرست"])
+            
+            if city_sup_combinations.empty:
+                st.info("هیچ ترکیب شهر/سرپرستی پیدا نشد.")
             else:
-                total_batches = math.ceil(total_n / batch_size)
-                batch_no = st.number_input("شمارهٔ دسته", min_value=1, max_value=total_batches, value=1, step=1)
-                start_idx = (batch_no - 1) * batch_size
-                end_idx = min(start_idx + batch_size, total_n)
-                st.caption(f"نمایش/دانلود دستهٔ {batch_no} از {total_batches} (ردیف‌های {start_idx+1} تا {end_idx} از {total_n})")
-
-                current_slice = subset.iloc[start_idx:end_idx]
-                batch_body = ""
-                city_ranks_df = compute_city_scores_ranks(stats)
-                team_ranks_df = compute_team_scores_ranks(stats)
-                for _, r in current_slice.iterrows():
+                st.write(f"**تعداد ترکیبات شهر/سرپرست:** {len(city_sup_combinations)}")
+                
+                # تابع کمکی برای ساخت کارت یک بازاریاب
+                def build_agent_card_data(r, df_raw, df7, mp, from_j_ref, to_j_ref, logo_b64, city_ranks_df, team_ranks_df):
+                    """ساخت HTML کارت برای یک بازاریاب"""
                     rid = str(r["آیدی"])
-
-                    # ✅ محاسبه تعداد راننده‌های فعال برای 4 هفته اخیر (همانند کارت تکی)
-                    # استفاده از df_raw برای دسترسی به همه داده‌ها
-                    _id_series_raw_batch = df_raw[mp["id"]].astype(str).str.strip()
-                    df_agent_batch_4weeks = df_raw[_id_series_raw_batch == rid.strip()].copy()
-
-                    if not df_agent_batch_4weeks.empty and mp.get("week"):
-                        # پیدا کردن 4 هفته اخیر بر اساس ستون week
-                        df_agent_batch_4weeks["_week_num"] = to_numeric_clean(df_agent_batch_4weeks[mp["week"]])
-                        df_agent_batch_4weeks = df_agent_batch_4weeks.dropna(subset=["_week_num"])
+                    
+                    # محاسبه تعداد راننده‌های فعال برای 4 هفته اخیر
+                    _id_series_raw = df_raw[mp["id"]].astype(str).str.strip()
+                    df_agent_4weeks = df_raw[_id_series_raw == rid.strip()].copy()
+                    
+                    if not df_agent_4weeks.empty and mp.get("week"):
+                        df_agent_4weeks["_week_num"] = to_numeric_clean(df_agent_4weeks[mp["week"]])
+                        df_agent_4weeks = df_agent_4weeks.dropna(subset=["_week_num"])
                         
-                        if not df_agent_batch_4weeks.empty:
-                            weeks_sorted_batch = sorted(df_agent_batch_4weeks["_week_num"].unique())
-                            if weeks_sorted_batch:
-                                last4_weeks_batch = weeks_sorted_batch[-4:]
-                                df_agent_batch_4weeks = df_agent_batch_4weeks[df_agent_batch_4weeks["_week_num"].isin(last4_weeks_batch)]
+                        if not df_agent_4weeks.empty:
+                            weeks_sorted = sorted(df_agent_4weeks["_week_num"].unique())
+                            if weeks_sorted:
+                                last4_weeks = weeks_sorted[-4:]
+                                df_agent_4weeks = df_agent_4weeks[df_agent_4weeks["_week_num"].isin(last4_weeks)]
                                 
-                                # محاسبه تعداد راننده‌های فعال و درصد برای 4 هفته اخیر
-                                if mp.get("active_drivers") and mp["active_drivers"] in df_agent_batch_4weeks.columns:
-                                    active_sum = to_numeric_clean(df_agent_batch_4weeks[mp["active_drivers"]]).sum()
-                                    # مقدار محاسبه‌شده را مستقیماً روی خود ر اعمال می‌کنیم تا در کارت نمایش داده شود
+                                # محاسبه تعداد راننده‌های فعال
+                                if mp.get("active_drivers") and mp["active_drivers"] in df_agent_4weeks.columns:
+                                    active_sum = to_numeric_clean(df_agent_4weeks[mp["active_drivers"]]).sum()
                                     r["تعداد راننده‌های فعال"] = active_sum
-
-                                    if mp.get("acq") and mp["acq"] in df_agent_batch_4weeks.columns:
-                                        acq_sum = to_numeric_clean(df_agent_batch_4weeks[mp["acq"]]).sum()
+                                    
+                                    if mp.get("acq") and mp["acq"] in df_agent_4weeks.columns:
+                                        acq_sum = to_numeric_clean(df_agent_4weeks[mp["acq"]]).sum()
                                         if acq_sum > 0:
                                             r["درصد راننده‌های فعال"] = (active_sum / acq_sum) * 100
                                         else:
@@ -3548,79 +4389,65 @@ if uploaded:
                                 else:
                                     r["تعداد راننده‌های فعال"] = None
                                     r["درصد راننده‌های فعال"] = None
-                                
-                                # ✅ محاسبه تعداد نقص مدارک و مقادیر هر ستون برای ۴ هفته اخیر
-                                # مشابه منطق کارت تکی: جمع مقدار هر ستون (صرف‌نظر از اینکه 1 یا 2 باشد) و محاسبه مجموع کلی
-                                doc_issue_cols_present_batch = [col for col in DOC_ISSUE_COLS if col in df_agent_batch_4weeks.columns]
-                                if doc_issue_cols_present_batch:
-                                    total_doc_issues_batch = 0.0
-                                    for col in doc_issue_cols_present_batch:
-                                        try:
-                                            col_numeric = to_numeric_clean(df_agent_batch_4weeks[col])
-                                            col_sum = col_numeric.sum()
-                                        except Exception:
-                                            col_sum = 0
-                                        # اگر NaN بود به‌عنوان صفر حساب کنیم
-                                        if pd.isna(col_sum):
-                                            col_sum = 0
-                                        # مقدار جمع‌شده را روی ر ذخیره کنیم تا در کارت نمایش داده شود
-                                        r[col] = col_sum
-                                        # فقط مقادیر مثبت در مجموع لحاظ شوند
-                                        try:
-                                            if float(col_sum) > 0:
-                                                total_doc_issues_batch += float(col_sum)
-                                        except Exception:
-                                            pass
-                                    # اگر مجموع کلی مثبت است، همان را ذخیره کن، در غیر این صورت صفر
-                                    r["تعداد نقص مدارک"] = total_doc_issues_batch if total_doc_issues_batch > 0 else 0
-                                else:
-                                    r["تعداد نقص مدارک"] = None
-                                
-                                # ✅ محاسبه درصد نقص مدارک بر اساس نسبت تعداد نقص مدارک به مجموع جذب این ۴ هفته
-                                try:
-                                    # مجموع جذب این ۴ هفته برای محاسبه درصد
-                                    acq_sum_for_doc = None
-                                    if mp.get("acq") and mp["acq"] in df_agent_batch_4weeks.columns:
-                                        acq_sum_for_doc = to_numeric_clean(df_agent_batch_4weeks[mp["acq"]]).sum()
-                                    total_docs_batch = r.get("تعداد نقص مدارک")
-                                    if acq_sum_for_doc is not None and acq_sum_for_doc > 0 and total_docs_batch is not None:
-                                        r["درصد نقص مدارک"] = (float(total_docs_batch) / float(acq_sum_for_doc)) * 100
-                                    else:
-                                        # اگر جذب صفر یا None باشد
-                                        if total_docs_batch is not None and float(total_docs_batch) == 0:
-                                            r["درصد نقص مدارک"] = 0
-                                        else:
-                                            r["درصد نقص مدارک"] = None
-                                except Exception:
-                                    r["درصد نقص مدارک"] = None
-                            else:
-                                r["تعداد راننده‌های فعال"] = None
-                                r["درصد راننده‌های فعال"] = None
-                                r["تعداد نقص مدارک"] = None
-                                r["درصد نقص مدارک"] = None
-                        else:
-                            r["تعداد راننده‌های فعال"] = None
-                            r["درصد راننده‌های فعال"] = None
-                            r["تعداد نقص مدارک"] = None
-                            r["درصد نقص مدارک"] = None
                     else:
                         r["تعداد راننده‌های فعال"] = None
                         r["درصد راننده‌های فعال"] = None
-                        r["تعداد نقص مدارک"] = None
-                        r["درصد نقص مدارک"] = None
+
+                    # ✅ تعداد و درصد نقص مدارک از r (که از stats آمده و بر اساس جذب هفته‌ای محاسبه شده) می‌آید
+                    # اما برای جزئیات هر ستون (بولت‌پوینت‌ها)، باید از همان بازه هفتگی استفاده کنیم
                     
+                    # پیدا کردن هفته(های) مورد استفاده برای این آیدی
+                    # برای محاسبه جزئیات، از همان بازه‌ای استفاده می‌کنیم که در stats استفاده شده
+                    _id_series_all = df_raw[mp["id"]].astype(str).str.strip()
+                    df_agent_weekly = df_raw[_id_series_all == rid.strip()].copy()
+                    
+                    # اگر ستون week وجود دارد، از آن استفاده می‌کنیم
+                    if mp.get("week") and mp["week"] in df_agent_weekly.columns:
+                        # پیدا کردن هفته(های) موجود در df7 برای این آیدی
+                        _id_series_df7 = df7[mp["id"]].astype(str).str.strip()
+                        df_agent_in_df7 = df7[_id_series_df7 == rid.strip()].copy()
+                        
+                        if not df_agent_in_df7.empty and mp["week"] in df_agent_in_df7.columns:
+                            # هفته‌های موجود در df7
+                            weeks_in_df7 = to_numeric_clean(df_agent_in_df7[mp["week"]]).dropna().unique().tolist()
+                            
+                            if weeks_in_df7:
+                                # فیلتر کردن داده‌های هفته‌ای برای همین هفته‌ها
+                                df_agent_weekly["_week_num"] = to_numeric_clean(df_agent_weekly[mp["week"]])
+                                df_agent_weekly = df_agent_weekly[df_agent_weekly["_week_num"].isin(weeks_in_df7)]
+                                
+                                # Unique کردن بر اساس آیدی و هفته
+                                df_agent_weekly = df_agent_weekly.drop_duplicates(subset=[mp["id"], mp["week"]], keep='first')
+                                
+                                # محاسبه جزئیات هر ستون نقص مدارک از بازه هفته‌ای
+                                doc_issue_cols_present = [col for col in DOC_ISSUE_COLS if col in df_agent_weekly.columns]
+                                if doc_issue_cols_present:
+                                    for col in doc_issue_cols_present:
+                                        try:
+                                            col_numeric = to_numeric_clean(df_agent_weekly[col])
+                                            col_sum = col_numeric.sum()
+                                            if pd.isna(col_sum):
+                                                col_sum = 0
+                                            r[col] = float(col_sum) if col_sum > 0 else 0
+                                        except Exception:
+                                            r[col] = 0
+                    
+                    # تعداد و درصد نقص مدارک از r (که از stats آمده) استفاده می‌شود
+                    # این مقادیر قبلاً در compute_weekly_stats بر اساس جذب هفته‌ای محاسبه شده‌اند
+                    
+                    # ساخت نمودار و محاسبه رتبه‌ها
                     agg = build_acq_trend_last4weeks(df_raw, mp, rid)
                     chart_src = build_acq_trend_svg_from_df(agg, width=420, height=160, point_fs=14)
-                    recent3   = acq_last_k_weeks_sum(df_raw, mp, rid, k=4)
+                    recent3 = acq_last_k_weeks_sum(df_raw, mp, rid, k=4)
                     last_week = acq_last_week_sum(df_raw, mp, rid)
-
+                    
                     rr = city_ranks_df[city_ranks_df["آیدی"].astype(str) == rid]
                     rt = f'{int(rr.iloc[0]["CityRank"])} از {int(rr.iloc[0]["CityCount"])}' if not rr.empty else None
-
+                    
                     team_rr = team_ranks_df[team_ranks_df["آیدی"].astype(str) == rid]
                     team_rt = f'{int(team_rr.iloc[0]["TeamRank"])} از {int(team_rr.iloc[0]["TeamCount"])}' if not team_rr.empty else None
-
-                    batch_body += build_card_html(
+                    
+                    return build_card_html(
                         r.to_dict(), from_j_ref, to_j_ref,
                         logo_src=logo_b64,
                         rank_text=rt, team_rank_text=team_rt,
@@ -3628,66 +4455,80 @@ if uploaded:
                         acq_recent3_total=recent3,
                         acq_last_week=last_week,
                     )
-
-                batch_html = build_agent_date_block_shamsi(from_j_ref, to_j_ref, logo_src=logo_b64) + batch_body
-
-                # نام فایل خروجی بر اساس شهر/سرپرست
-                file_city = (sel_city if sel_city != "همه" else "all_cities").replace(" ", "_")
-                file_sup  = (sel_sup  if sel_sup  != "همه" else "all_supervisors").replace(" ", "_")
-
-                html_download_button(
-                    f"cards_{file_city}_{file_sup}_batch{batch_no}_of_{total_batches}.html",
-                    batch_html,
-                    "دانلود HTML این دسته"
-                )
-
-                # --- لینک دانلود همهٔ دسته‌ها (هر دسته یک فایل) ---
-                with st.expander("لینک دانلود همهٔ دسته‌ها (هر دسته یک فایل)", expanded=False):
-                    for b in range(1, total_batches+1):
-                        s = (b-1)*batch_size
-                        e = min(s+batch_size, total_n)
-                        sl = subset.iloc[s:e]
-
-                        body = ""
-                        for _, r in sl.iterrows():
-                            rid = str(r["آیدی"])
-
-                            # رتبه شهر
-                            rr = city_ranks_df[city_ranks_df["آیدی"].astype(str) == rid]
-                            rt = f'{int(rr.iloc[0]["CityRank"])} از {int(rr.iloc[0]["CityCount"])}' if not rr.empty else None
-
-                            # رتبه تیم
-                            team_rr = team_ranks_df[team_ranks_df["آیدی"].astype(str) == rid]
-                            team_rt = f'{int(team_rr.iloc[0]["TeamRank"])} از {int(team_rr.iloc[0]["TeamCount"])}' if not team_rr.empty else None
-
-                            # ✅ نمودار و جمع سه‌هفته‌ای
-                            agg = build_acq_trend_last4weeks(df_raw, mp, rid)
-                            chart_src = build_acq_trend_svg_from_df(agg, width=420, height=160, point_fs=14)
-                            recent3   = acq_last_k_weeks_sum(df_raw, mp, rid, k=4)
-                            last_week = acq_last_week_sum(df_raw, mp, rid)
-
-                            # کارت با همه‌ی پارامترهای لازم
-                            body += build_card_html(
-                                r.to_dict(), from_j_ref, to_j_ref,
-                                logo_src=logo_b64,
-                                rank_text=rt, team_rank_text=team_rt,
-                                acq_chart_src=chart_src,
-                                acq_recent3_total=recent3,
-                                acq_last_week=last_week,
-                            )
-
-                        out_html = build_agent_date_block_shamsi(from_j_ref, to_j_ref, logo_src=logo_b64) + body
-                        fname = f"cards_{file_city}_{file_sup}_batch{b}_of_{total_batches}.html"
-                        b64 = base64.b64encode(out_html.encode("utf-8")).decode()
-                        st.markdown(f'• <a download="{fname}" href="data:text/html;base64,{b64}">{fname}</a>', unsafe_allow_html=True)
+                
+                # ساخت فایل برای هر ترکیب شهر/سرپرست
+                progress_bar = st.progress(0)
+                download_links = []
+                
+                for idx, (_, combo) in enumerate(city_sup_combinations.iterrows()):
+                    city_name = str(combo["شهر"]) if pd.notna(combo["شهر"]) else "نامشخص"
+                    sup_name = str(combo["سرپرست"]) if pd.notna(combo["سرپرست"]) else "نامشخص"
+                    
+                    # فیلتر بازاریاب‌های این شهر و سرپرست
+                    subset = stats[
+                        (stats["شهر"] == combo["شهر"]) & 
+                        (stats["سرپرست"] == combo["سرپرست"])
+                    ].copy()
+                    
+                    if subset.empty:
+                        continue
+                    
+                    # ✅ مرتب‌سازی بر اساس رتبه شهر (از کم به زیاد، یعنی رتبه 1 اول می‌آید)
+                    # merge کردن با city_ranks_df برای داشتن CityRank
+                    subset = subset.merge(
+                        city_ranks_df[["آیدی", "CityRank"]], 
+                        on="آیدی", 
+                        how="left"
+                    )
+                    # مرتب‌سازی بر اساس CityRank (صعودی: رتبه 1 اول می‌آید)
+                    subset = subset.sort_values("CityRank", ascending=True, na_position="last")
+                    
+                    # ساخت HTML برای تمام بازاریاب‌های این ترکیب
+                    body = ""
+                    for _, r in subset.iterrows():
+                        body += build_agent_card_data(
+                            r, df_raw, df7, mp, from_j_ref, to_j_ref, 
+                            logo_b64, city_ranks_df, team_ranks_df
+                        )
+                    
+                    out_html = build_agent_date_block_shamsi(from_j_ref, to_j_ref, logo_src=logo_b64) + body
+                    
+                    # نام فایل
+                    file_city = city_name.replace(" ", "_").replace("/", "_")
+                    file_sup = sup_name.replace(" ", "_").replace("/", "_")
+                    fname = f"cards_{file_city}_{file_sup}.html"
+                    
+                    # ذخیره لینک دانلود
+                    b64 = base64.b64encode(out_html.encode("utf-8")).decode()
+                    download_links.append({
+                        "city": city_name,
+                        "supervisor": sup_name,
+                        "count": len(subset),
+                        "filename": fname,
+                        "b64": b64
+                    })
+                    
+                    # به‌روزرسانی progress bar
+                    progress_bar.progress((idx + 1) / len(city_sup_combinations))
+                
+                progress_bar.empty()
+                
+                # نمایش لینک‌های دانلود
+                st.markdown("### لینک‌های دانلود")
+                for link in download_links:
+                    st.markdown(
+                        f'• **{link["city"]} - {link["supervisor"]}** ({link["count"]} بازاریاب): '
+                        f'<a download="{link["filename"]}" href="data:text/html;base64,{link["b64"]}">{link["filename"]}</a>',
+                        unsafe_allow_html=True
+                    )
 
     # ======== MODE 2: Supervisor ========
     else:
-        sup_day_all = compute_supervisor_daily(df7, mp)
-        ov_total_all = compute_supervisor_overview_total(sup_day_all)
+        sup_day_all = compute_supervisor_daily(df_week, mp)
+        ov_total_all = compute_supervisor_overview_total(df_week, mp)
         
         # ✅ میانگین TOTAL QC SCORE و QC ناظران / راننده ها برای هر سرپرست در همین بازه
-        stats_sup = compute_weekly_stats(df7, mp)
+        stats_sup = compute_weekly_stats(df_week, mp)
 
         # --- میانگین TOTAL QC SCORE ---
         if "TOTAL QC SCORE" in stats_sup.columns:
@@ -3751,7 +4592,7 @@ if uploaded:
         date_to_disp   = to_jalali_words(_to_g,   persian_digits=True)
 
         city_disp = sel_city if sel_city != "همه" else "، ".join(sorted(day_tbl["شهر"].dropna().unique()))
-        html = build_supervisor_html_persian(
+        supervisor_html = build_supervisor_html_persian(
             sel_sup,
             city_disp,
             from_j_ref,          # ✅ تاریخ شروع مرجع (week آخر)
@@ -3760,7 +4601,102 @@ if uploaded:
             daily_df=day_tbl,
             logo_src=logo_b64
         )
-        st.components.v1.html(html, height=900, scrolling=True)
+        st.components.v1.html(supervisor_html, height=900, scrolling=True)
         fname = f"supervisor_{sel_sup}_{city_disp}.html".replace(" ", "_")
-        b64 = base64.b64encode(html.encode("utf-8")).decode()
+        b64 = base64.b64encode(supervisor_html.encode("utf-8")).decode()
         st.markdown(f'<a download="{fname}" href="data:text/html;base64,{b64}">دانلود HTML گزارش سرپرست</a>', unsafe_allow_html=True)
+        odf_download_button(
+            f"supervisor_{sel_sup}_{city_disp}.fodt".replace(" ", "_"),
+            supervisor_html,
+            "دانلود ODF (متن ساده) گزارش سرپرست",
+            title=f"گزارش سرپرست {sel_sup} ({city_disp})",
+        )
+
+    # --- دانلود خودکار گزارش‌های سرپرست برای همه ترکیبات شهر/سرپرست ---
+    spacer(12)
+    with st.expander("دانلود گزارش‌های سرپرست برای همه ترکیبات شهر/سرپرست (اختیاری)", expanded=False):
+        st.info("برای هر ترکیب شهر/سرپرست، یک فایل HTML شامل گزارش آن سرپرست ساخته می‌شود.")
+        
+        # پیدا کردن تمام ترکیبات شهر/سرپرست
+        if "sup_day_all" not in locals():
+            sup_day_all = pd.DataFrame(columns=["\u0634\u0647\u0631", "\u0633\u0631\u067e\u0631\u0633\u062a"])
+            ov_total_all = pd.DataFrame(columns=["\u0634\u0647\u0631", "\u0633\u0631\u067e\u0631\u0633\u062a"])
+        sup_city_combinations = sup_day_all.groupby(["شهر", "سرپرست"], dropna=False).size().reset_index(name="count")
+        sup_city_combinations = sup_city_combinations.sort_values(["شهر", "سرپرست"])
+        
+        if sup_city_combinations.empty:
+            st.info("هیچ ترکیب شهر/سرپرستی پیدا نشد.")
+        else:
+            st.write(f"**تعداد ترکیبات شهر/سرپرست:** {len(sup_city_combinations)}")
+            
+            # ساخت فایل برای هر ترکیب شهر/سرپرست
+            progress_bar = st.progress(0)
+            download_links = []
+            
+            for idx, (_, combo) in enumerate(sup_city_combinations.iterrows()):
+                city_name = str(combo["شهر"]) if pd.notna(combo["شهر"]) else "نامشخص"
+                sup_name = str(combo["سرپرست"]) if pd.notna(combo["سرپرست"]) else "نامشخص"
+                
+                # فیلتر داده‌های این شهر و سرپرست
+                day_tbl_combo = sup_day_all[
+                    (sup_day_all["شهر"] == combo["شهر"]) & 
+                    (sup_day_all["سرپرست"] == combo["سرپرست"])
+                ].copy()
+                
+                ov_tbl_combo = ov_total_all[
+                    (ov_total_all["شهر"] == combo["شهر"]) & 
+                    (ov_total_all["سرپرست"] == combo["سرپرست"])
+                ].copy()
+                
+                if day_tbl_combo.empty:
+                    continue
+                
+                # محاسبه تاریخ برای این ترکیب
+                if not day_tbl_combo.empty:
+                    _from_g_combo = pd.to_datetime(day_tbl_combo["تاریخ"]).min().date()
+                    _to_g_combo = pd.to_datetime(day_tbl_combo["تاریخ"]).max().date()
+                else:
+                    _to_g_combo = anchor
+                    _from_g_combo = anchor - timedelta(days=6)
+                
+                city_disp_combo = city_name
+                
+                # ساخت HTML گزارش
+                html_combo = build_supervisor_html_persian(
+                    sup_name,
+                    city_disp_combo,
+                    from_j_ref,
+                    to_j_ref,
+                    overview_df=ov_tbl_combo,
+                    daily_df=day_tbl_combo,
+                    logo_src=logo_b64
+                )
+                
+                # نام فایل
+                file_city = city_name.replace(" ", "_").replace("/", "_")
+                file_sup = sup_name.replace(" ", "_").replace("/", "_")
+                fname_combo = f"supervisor_{file_sup}_{file_city}.html"
+                
+                # ذخیره لینک دانلود
+                b64_combo = base64.b64encode(html_combo.encode("utf-8")).decode()
+                download_links.append({
+                    "city": city_name,
+                    "supervisor": sup_name,
+                    "filename": fname_combo,
+                    "b64": b64_combo
+                })
+                
+                # به‌روزرسانی progress bar
+                progress_bar.progress((idx + 1) / len(sup_city_combinations))
+            
+            progress_bar.empty()
+            
+            # نمایش لینک‌های دانلود
+            st.markdown("### لینک‌های دانلود")
+            for link in download_links:
+                st.markdown(
+                    f'• **{link["city"]} - {link["supervisor"]}**: '
+                    f'<a download="{link["filename"]}" href="data:text/html;base64,{link["b64"]}">{link["filename"]}</a>',
+                    unsafe_allow_html=True
+                )
+
